@@ -1,0 +1,35 @@
+# Binaries
+mcode-cli
+mcode-cli.exe
+
+# Go build cache
+*.out
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Logs
+*.log
+
+# Local environment files
+.env
+.env.local
+
+# Test coverage
+coverage.out
