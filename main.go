@@ -14,7 +14,6 @@ import (
 
 	"github.com/chzyer/readline"
 	"github.com/sashabaranov/go-openai"
-	"github.com/spf13/cobra"
 )
 
 type Config struct {
@@ -1567,111 +1566,92 @@ var completer = readline.NewPrefixCompleter(
 )
 
 func main() {
-	var rootCmd = &cobra.Command{
-		Use:   "mcode-cli",
-		Short: "A coding agent CLI built with Go that uses LM Studio locally",
-		Run: func(cmd *cobra.Command, args []string) {
-			agent := NewAgent()
-			ctx := context.Background()
-
-			if len(args) > 0 {
-				message := strings.Join(args, " ")
-				if err := agent.Chat(ctx, message); err != nil {
-					fmt.Printf("Error: %v\n", err)
-					os.Exit(1)
-				}
-			} else {
-				// Get current model info for display
-				currentModel, exists := agent.config.Models[agent.config.CurrentModel]
-				if !exists {
-					currentModel = Model{Name: "unknown", BaseURL: "unknown"}
-				}
-				
-				fmt.Printf("MCode CLI - Connected to %s\n", currentModel.BaseURL)
-				fmt.Printf("Model: %s (%s)\n", currentModel.Name, agent.config.CurrentModel)
-				fmt.Println("Enter your message (type '/help' for commands, '#instruction' for permanent memory, 'exit' to quit):")
-				
-				// Setup readline with history
-				rl, err := readline.NewEx(&readline.Config{
-					Prompt:          "> ",
-					HistoryFile:     filepath.Join(os.TempDir(), ".mcode_history"),
-					AutoComplete:    completer,
-					InterruptPrompt: "^C",
-					EOFPrompt:       "exit",
-				})
-				if err != nil {
-					fmt.Printf("Error setting up readline: %v\n", err)
-					return
-				}
-				defer rl.Close()
-
-				for {
-					// Update prompt with token count
-					tokens := agent.getContextTokens()
-					if tokens > 0 {
-						if tokens >= 1000 {
-							rl.SetPrompt(fmt.Sprintf("[%dk tokens] > ", tokens/1000))
-						} else {
-							rl.SetPrompt(fmt.Sprintf("[%d tokens] > ", tokens))
-						}
-					} else {
-						rl.SetPrompt("> ")
-					}
-					
-					line, err := rl.Readline()
-					if err != nil { // io.EOF or interrupt
-						break
-					}
-					
-					input := strings.TrimSpace(line)
-					if input == "exit" || input == "quit" {
-						break
-					}
-					
-					if input == "" {
-						continue
-					}
-
-					// Handle slash commands
-					if strings.HasPrefix(input, "/") {
-						shouldExit, err := agent.handleSlashCommand(input)
-						if err != nil {
-							fmt.Printf("Error: %v\n", err)
-						}
-						if shouldExit {
-							break
-						}
-						continue
-					}
-
-					// Handle permanent instruction commands
-					if strings.HasPrefix(input, "#") {
-						instruction := strings.TrimSpace(input[1:])
-						if instruction == "" {
-							fmt.Println("❌ Please provide an instruction after #")
-							continue
-						}
-						
-						fmt.Printf("💾 Adding permanent instruction: %s\n", instruction)
-						if err := agent.addPermanentInstruction(instruction); err != nil {
-							fmt.Printf("Error saving instruction: %v\n", err)
-						} else {
-							fmt.Printf("✅ Permanent instruction saved to AGENTS.md\n")
-						}
-						continue
-					}
-
-					// Regular chat message
-					if err := agent.Chat(ctx, input); err != nil {
-						fmt.Printf("Error: %v\n", err)
-					}
-				}
-			}
-		},
+	agent := NewAgent()
+	ctx := context.Background()
+	
+	// Get current model info for display
+	currentModel, exists := agent.config.Models[agent.config.CurrentModel]
+	if !exists {
+		currentModel = Model{Name: "unknown", BaseURL: "unknown"}
 	}
+	
+	fmt.Printf("MCode CLI - Connected to %s\n", currentModel.BaseURL)
+	fmt.Printf("Model: %s (%s)\n", currentModel.Name, agent.config.CurrentModel)
+	fmt.Println("Enter your message (type '/help' for commands, '#instruction' for permanent memory, 'exit' to quit):")
+	
+	// Setup readline with history
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:          "> ",
+		HistoryFile:     filepath.Join(os.TempDir(), ".mcode_history"),
+		AutoComplete:    completer,
+		InterruptPrompt: "^C",
+		EOFPrompt:       "exit",
+	})
+	if err != nil {
+		fmt.Printf("Error setting up readline: %v\n", err)
+		return
+	}
+	defer rl.Close()
 
-	if err := rootCmd.Execute(); err != nil {
-		fmt.Printf("Error: %v\n", err)
-		os.Exit(1)
+	for {
+		// Update prompt with token count
+		tokens := agent.getContextTokens()
+		if tokens > 0 {
+			if tokens >= 1000 {
+				rl.SetPrompt(fmt.Sprintf("[%dk tokens] > ", tokens/1000))
+			} else {
+				rl.SetPrompt(fmt.Sprintf("[%d tokens] > ", tokens))
+			}
+		} else {
+			rl.SetPrompt("> ")
+		}
+		
+		line, err := rl.Readline()
+		if err != nil { // io.EOF or interrupt
+			break
+		}
+		
+		input := strings.TrimSpace(line)
+		if input == "exit" || input == "quit" {
+			break
+		}
+		
+		if input == "" {
+			continue
+		}
+
+		// Handle slash commands
+		if strings.HasPrefix(input, "/") {
+			shouldExit, err := agent.handleSlashCommand(input)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+			}
+			if shouldExit {
+				break
+			}
+			continue
+		}
+
+		// Handle permanent instruction commands
+		if strings.HasPrefix(input, "#") {
+			instruction := strings.TrimSpace(input[1:])
+			if instruction == "" {
+				fmt.Println("❌ Please provide an instruction after #")
+				continue
+			}
+			
+			fmt.Printf("💾 Adding permanent instruction: %s\n", instruction)
+			if err := agent.addPermanentInstruction(instruction); err != nil {
+				fmt.Printf("Error saving instruction: %v\n", err)
+			} else {
+				fmt.Printf("✅ Permanent instruction saved to AGENTS.md\n")
+			}
+			continue
+		}
+
+		// Regular chat message
+		if err := agent.Chat(ctx, input); err != nil {
+			fmt.Printf("Error: %v\n", err)
+		}
 	}
 }
