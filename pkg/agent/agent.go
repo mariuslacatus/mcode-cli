@@ -379,7 +379,37 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 
 		// Show parameters nicely
 		for key, value := range params {
-			fmt.Printf("   %s: %v\n", key, value)
+			if toolCall.Function.Name == "edit_file" && key == "content" {
+				// For edit_file, show a diff preview instead of raw content
+				if pathParam, exists := params["path"]; exists {
+					if pathStr, ok := pathParam.(string); ok {
+						if contentStr, ok := value.(string); ok {
+							// Read existing content for diff
+							var oldContent string
+							if existingContent, err := os.ReadFile(pathStr); err == nil {
+								oldContent = string(existingContent)
+							}
+							
+							// Generate and display diff preview
+							if oldContent != contentStr {
+								fmt.Printf("   %s: <showing diff preview>\n", key)
+								diff := tools.GenerateDiff(oldContent, contentStr, pathStr)
+								fmt.Print(diff)
+							} else {
+								fmt.Printf("   %s: <no changes>\n", key)
+							}
+						} else {
+							fmt.Printf("   %s: <content>\n", key)
+						}
+					} else {
+						fmt.Printf("   %s: <content>\n", key)
+					}
+				} else {
+					fmt.Printf("   %s: <content>\n", key)
+				}
+			} else {
+				fmt.Printf("   %s: %v\n", key, value)
+			}
 		}
 
 		// Check if this looks like a long-running command
@@ -394,12 +424,12 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 
 		// Check if this is a folder operation that needs permission
 		shouldAutoExecute := false
-		if toolCall.Function.Name == "list_files" || toolCall.Function.Name == "read_file" {
+		if toolCall.Function.Name == "list_files" || toolCall.Function.Name == "read_file" || toolCall.Function.Name == "preview_edit" {
 			var folderPath string
 			if pathParam, exists := params["path"]; exists {
 				if pathStr, ok := pathParam.(string); ok {
-					if toolCall.Function.Name == "read_file" {
-						// For read_file, get the directory of the file
+					if toolCall.Function.Name == "read_file" || toolCall.Function.Name == "preview_edit" {
+						// For read_file and preview_edit, get the directory of the file
 						folderPath = filepath.Dir(pathStr)
 					} else {
 						// For list_files, use the path directly
@@ -435,6 +465,8 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 				fmt.Printf("📁 Listing files (auto-approved folder)\n")
 			} else if toolCall.Function.Name == "read_file" {
 				fmt.Printf("📖 Reading file (auto-approved folder)\n")
+			} else if toolCall.Function.Name == "preview_edit" {
+				fmt.Printf("👀 Previewing file changes (auto-approved folder)\n")
 			}
 		} else {
 			// Ask for confirmation for other operations

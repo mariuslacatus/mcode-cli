@@ -275,17 +275,45 @@ func (m *Manager) EditFile(params map[string]interface{}) (string, error) {
 		return "", fmt.Errorf("error writing file: %v", err)
 	}
 
-	// Generate and display diff
-	if oldContent != "" && oldContent != content {
-		diff := GenerateDiff(oldContent, content, path)
-		fmt.Print(diff)
-		return fmt.Sprintf("File %s has been modified", path), nil
-	} else if oldContent == "" {
-		fmt.Printf("%s📄 Created new file: %s%s\n", types.ColorGreen, path, types.ColorReset)
+	// Return appropriate message without showing diff again
+	if oldContent == "" {
 		return fmt.Sprintf("File %s has been created", path), nil
+	} else if oldContent != content {
+		return fmt.Sprintf("File %s has been modified", path), nil
 	}
 
 	return fmt.Sprintf("File %s unchanged", path), nil
+}
+
+// PreviewEdit shows what changes would be made to a file without writing
+func (m *Manager) PreviewEdit(params map[string]interface{}) (string, error) {
+	path, ok := params["path"].(string)
+	if !ok {
+		return "", fmt.Errorf("path parameter is required")
+	}
+
+	content, ok := params["content"].(string)
+	if !ok {
+		return "", fmt.Errorf("content parameter is required")
+	}
+
+	// Read existing content for diff
+	var oldContent string
+	if existingContent, err := os.ReadFile(path); err == nil {
+		oldContent = string(existingContent)
+	}
+
+	// Generate and display diff
+	if oldContent != content {
+		diff := GenerateDiff(oldContent, content, path)
+		fmt.Print(diff)
+		if oldContent == "" {
+			return fmt.Sprintf("Preview: Would create new file %s", path), nil
+		}
+		return fmt.Sprintf("Preview: Would modify file %s", path), nil
+	}
+
+	return fmt.Sprintf("Preview: No changes would be made to %s", path), nil
 }
 
 // SearchCode searches for code patterns in files
