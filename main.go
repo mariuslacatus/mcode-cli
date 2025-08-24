@@ -992,6 +992,10 @@ func (a *Agent) clearContext() {
 	a.conversation = []openai.ChatCompletionMessage{}
 	a.lastTokenUsage = nil
 	// Don't reset totalTokensUsed - keep session total
+	
+	// Clear terminal
+	fmt.Print("\033[2J\033[H")
+	
 	fmt.Printf("%s🔄 Conversation context cleared - Starting fresh!%s\n", ColorGreen, ColorReset)
 }
 
@@ -1568,6 +1572,9 @@ var completer = readline.NewPrefixCompleter(
 func main() {
 	agent := NewAgent()
 	ctx := context.Background()
+	
+	// Clear terminal on startup
+	fmt.Print("\033[2J\033[H")
 	
 	// Get current model info for display
 	currentModel, exists := agent.config.Models[agent.config.CurrentModel]
