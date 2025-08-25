@@ -481,35 +481,82 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 			if toolCall.Function.Name == "edit_file" {
 				var params map[string]interface{}
 				if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &params); err == nil {
-					if pathParam, exists := params["path"]; exists {
-						if pathStr, ok := pathParam.(string); ok {
-							
-							if contentParam, exists := params["content"]; exists {
-								if contentStr, ok := contentParam.(string); ok {
-									// Read existing content for diff
-									var oldContent string
-									if existingContent, err := os.ReadFile(pathStr); err == nil {
-										oldContent = string(existingContent)
-									}
-									
-									// Generate and stream diff to simulate real-time streaming
-									if oldContent != contentStr {
-										diffHeader := fmt.Sprintf("\n\n📝 **Diff Preview for %s:**\n", pathStr)
-										fmt.Print(diffHeader)
-										os.Stdout.Sync()
-										fullContent.WriteString(diffHeader)
-										
-										diff := tools.GenerateDiff(oldContent, contentStr, pathStr)
-										// Stream the diff with simulated typing effect
-										streamDiff(diff, &fullContent)
-									} else {
-										noDiffMsg := fmt.Sprintf("\n\n📝 **No changes for %s**\n", pathStr)
-										fmt.Print(noDiffMsg)
-										os.Stdout.Sync()
-										fullContent.WriteString(noDiffMsg)
+					// Handle both old and new parameter names
+					var pathStr string
+					if filePath, exists := params["filePath"]; exists {
+						if fp, ok := filePath.(string); ok {
+							pathStr = fp
+						}
+					} else if path, exists := params["path"]; exists {
+						if p, ok := path.(string); ok {
+							pathStr = p
+						}
+					}
+					
+					if pathStr != "" {
+						// Read existing content
+						var oldContent string
+						if existingContent, err := os.ReadFile(pathStr); err == nil {
+							oldContent = string(existingContent)
+						}
+						
+						var newContent string
+						var editType string
+						
+						// Check for incremental edit (OpenCode style: oldString + newString)
+						if oldString, hasOld := params["oldString"]; hasOld {
+							if oldStr, ok := oldString.(string); ok {
+								if newString, hasNew := params["newString"]; hasNew {
+									if newStr, ok := newString.(string); ok {
+										// Simulate incremental replacement for preview
+										if oldStr == "" {
+											// New file creation
+											newContent = newStr
+											editType = "NEW FILE"
+										} else {
+											// Incremental edit - do the replacement for preview
+											newContent = strings.Replace(oldContent, oldStr, newStr, 1)
+											editType = "INCREMENTAL"
+										}
 									}
 								}
 							}
+						} else if newString, hasNew := params["newString"]; hasNew {
+							// New file with just newString
+							if newStr, ok := newString.(string); ok {
+								newContent = newStr
+								editType = "NEW FILE"
+							}
+						} else if content, exists := params["content"]; exists {
+							// Legacy full replacement
+							if contentStr, ok := content.(string); ok {
+								newContent = contentStr
+								editType = "FULL REPLACEMENT"
+							}
+						}
+						
+						// Generate and stream diff if content changes
+						if newContent != "" && oldContent != newContent {
+							var diffHeader string
+							if editType == "INCREMENTAL" {
+								diffHeader = fmt.Sprintf("\n\n📝 **🚀 Incremental Edit Preview for %s:**\n", pathStr)
+							} else if editType == "NEW FILE" {
+								diffHeader = fmt.Sprintf("\n\n📝 **🚀 New File Preview for %s:**\n", pathStr)
+							} else {
+								diffHeader = fmt.Sprintf("\n\n📝 **📄 Full Replacement Preview for %s:**\n", pathStr)
+							}
+							fmt.Print(diffHeader)
+							os.Stdout.Sync()
+							fullContent.WriteString(diffHeader)
+							
+							diff := tools.GenerateDiff(oldContent, newContent, pathStr)
+							// Stream the diff with simulated typing effect
+							streamDiff(diff, &fullContent)
+						} else if newContent == oldContent {
+							noDiffMsg := fmt.Sprintf("\n\n📝 **No changes for %s**\n", pathStr)
+							fmt.Print(noDiffMsg)
+							os.Stdout.Sync()
+							fullContent.WriteString(noDiffMsg)
 						}
 					}
 				}
@@ -566,9 +613,29 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 		
 		// Add relevant parameters for different tools
 		switch toolCall.Function.Name {
-		case "read_file", "edit_file", "preview_edit":
+		case "read_file", "preview_edit":
 			if path, exists := params["path"]; exists {
 				toolDisplay += fmt.Sprintf(" <%v>", path)
+			}
+		case "edit_file":
+			// Handle both old and new parameter names
+			var path string
+			if filePath, exists := params["filePath"]; exists {
+				path = fmt.Sprintf("%v", filePath)
+			} else if oldPath, exists := params["path"]; exists {
+				path = fmt.Sprintf("%v", oldPath)
+			}
+			
+			// Show the mode being used
+			if oldString, hasOld := params["oldString"]; hasOld && oldString != "" {
+				// Incremental mode - FAST!
+				toolDisplay += fmt.Sprintf(" 🚀 %s [INCREMENTAL]", path)
+			} else if _, hasNewString := params["newString"]; hasNewString {
+				// New file mode - FAST!
+				toolDisplay += fmt.Sprintf(" 🚀 %s [NEW FILE]", path)
+			} else {
+				// Full replacement mode - SLOW!
+				toolDisplay += fmt.Sprintf(" 📄 %s [FULL REPLACEMENT]", path)
 			}
 		case "list_files":
 			if path, exists := params["path"]; exists {

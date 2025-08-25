@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -90,20 +91,28 @@ func (m *Manager) GetToolDefinitions() []openai.Tool {
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
 				Name:        "edit_file",
-				Description: "Edit or create a file",
+				Description: "Perform incremental edits to a file using find-and-replace. MUCH FASTER than full file rewrites. For new files, use newString only. For edits, use oldString+newString.",
 				Parameters: map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
-						"path": map[string]interface{}{
+						"filePath": map[string]interface{}{
 							"type":        "string",
-							"description": "Path to the file",
+							"description": "The absolute path to the file to modify",
 						},
-						"content": map[string]interface{}{
+						"oldString": map[string]interface{}{
 							"type":        "string",
-							"description": "New content for the file",
+							"description": "The text to replace (for editing existing files). Supports fuzzy matching for whitespace differences.",
+						},
+						"newString": map[string]interface{}{
+							"type":        "string",
+							"description": "The replacement text. For new files, provide this without oldString. For edits, use with oldString.",
+						},
+						"replaceAll": map[string]interface{}{
+							"type":        "boolean",
+							"description": "Replace all occurrences of oldString (default: false - only replace if unique match)",
 						},
 					},
-					"required": []string{"path", "content"},
+					"required": []string{"filePath", "newString"},
 				},
 			},
 		},
@@ -251,18 +260,110 @@ func (m *Manager) BashCommandBackground(params map[string]interface{}) string {
 	return fmt.Sprintf("Command started in background with PID %d. Use 'ps aux | grep \"%s\"' to check status.", cmd.Process.Pid, command)
 }
 
-// EditFile creates or edits a file
+// EditFile creates or edits a file using OpenCode-compatible parameters.
 func (m *Manager) EditFile(params map[string]interface{}) (string, error) {
-	path, ok := params["path"].(string)
+	filePath, ok := params["filePath"].(string)
 	if !ok {
-		return "", fmt.Errorf("path parameter is required")
+		return "", fmt.Errorf("filePath parameter is required")
 	}
 
-	content, ok := params["content"].(string)
-	if !ok {
-		return "", fmt.Errorf("content parameter is required")
+	// Check for incremental edit (oldString + newString)
+	if oldStringParam, exists := params["oldString"]; exists {
+		oldString, ok := oldStringParam.(string)
+		if !ok {
+			return "", fmt.Errorf("oldString parameter must be a string")
+		}
+
+		newString, ok := params["newString"].(string)
+		if !ok {
+			return "", fmt.Errorf("newString parameter is required when using oldString")
+		}
+
+		replaceAll := false
+		if replaceAllParam, exists := params["replaceAll"]; exists {
+			if replaceAllBool, ok := replaceAllParam.(bool); ok {
+				replaceAll = replaceAllBool
+			}
+		}
+
+		// Perform incremental edit
+		result, err := m.performIncrementalEdit(filePath, oldString, newString, replaceAll)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("🚀🚀🚀 INCREMENTAL EDIT MODE (FAST!) 🚀🚀🚀\n%s", result), nil
 	}
 
+	// For new file creation, use newString parameter
+	if newStringParam, exists := params["newString"]; exists {
+		newString, ok := newStringParam.(string)
+		if !ok {
+			return "", fmt.Errorf("newString parameter must be a string")
+		}
+
+		// Create new file (oldString = "")
+		result, err := m.performIncrementalEdit(filePath, "", newString, false)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("🚀🚀🚀 NEW FILE CREATION (FAST!) 🚀🚀🚀\n%s", result), nil
+	}
+
+	// Fallback: if content parameter exists, use full replacement
+	if contentParam, exists := params["content"]; exists {
+		content, ok := contentParam.(string)
+		if !ok {
+			return "", fmt.Errorf("content parameter must be a string")
+		}
+
+		result, err := m.performFullFileEdit(filePath, content)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("📄📄📄 FULL REPLACEMENT MODE (SLOW!) 📄📄📄\n%s", result), nil
+	}
+
+	return "", fmt.Errorf("either newString (for new files) or oldString+newString (for edits) or content (for full replacement) must be provided")
+}
+
+// performIncrementalEdit handles incremental file editing
+func (m *Manager) performIncrementalEdit(path, oldString, newString string, replaceAll bool) (string, error) {
+	// Handle new file creation (empty oldString)
+	if oldString == "" {
+		err := os.WriteFile(path, []byte(newString), 0644)
+		if err != nil {
+			return "", fmt.Errorf("error creating file: %v", err)
+		}
+		return fmt.Sprintf("File %s has been created", path), nil
+	}
+
+	// Read existing content
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("error reading file: %v", err)
+	}
+
+	oldContent := string(content)
+
+	// Perform incremental replacement
+	newContent, err := ReplaceInContent(oldContent, oldString, newString, replaceAll)
+	if err != nil {
+		return "", fmt.Errorf("replacement failed: %v", err)
+	}
+
+	// Write the updated content
+	err = os.WriteFile(path, []byte(newContent), 0644)
+	if err != nil {
+		return "", fmt.Errorf("error writing file: %v", err)
+	}
+
+	// Generate and return a focused diff
+	diff := GenerateFocusedDiff(oldContent, newContent, path, oldString, newString)
+	return diff, nil
+}
+
+// performFullFileEdit handles full file replacement (original behavior)
+func (m *Manager) performFullFileEdit(path, content string) (string, error) {
 	// Read existing content for diff
 	var oldContent string
 	if existingContent, err := os.ReadFile(path); err == nil {
@@ -353,4 +454,219 @@ func IsLongRunningCommand(command string) bool {
 		}
 	}
 	return false
+}
+
+// Replacer represents a strategy for finding strings to replace
+type Replacer interface {
+	FindMatches(content, find string) []string
+}
+
+// SimpleReplacer finds exact string matches
+type SimpleReplacer struct{}
+
+func (r *SimpleReplacer) FindMatches(content, find string) []string {
+	if strings.Contains(content, find) {
+		return []string{find}
+	}
+	return []string{}
+}
+
+// LineTrimmedReplacer finds matches by comparing trimmed lines
+type LineTrimmedReplacer struct{}
+
+func (r *LineTrimmedReplacer) FindMatches(content, find string) []string {
+	originalLines := strings.Split(content, "\n")
+	searchLines := strings.Split(find, "\n")
+
+	// Remove trailing empty line if present
+	if len(searchLines) > 0 && searchLines[len(searchLines)-1] == "" {
+		searchLines = searchLines[:len(searchLines)-1]
+	}
+
+	for i := 0; i <= len(originalLines)-len(searchLines); i++ {
+		matches := true
+
+		for j := 0; j < len(searchLines); j++ {
+			originalTrimmed := strings.TrimSpace(originalLines[i+j])
+			searchTrimmed := strings.TrimSpace(searchLines[j])
+
+			if originalTrimmed != searchTrimmed {
+				matches = false
+				break
+			}
+		}
+
+		if matches {
+			// Calculate the actual substring in the original content
+			matchStart := 0
+			for k := 0; k < i; k++ {
+				matchStart += len(originalLines[k]) + 1 // +1 for newline
+			}
+
+			matchEnd := matchStart
+			for k := 0; k < len(searchLines); k++ {
+				matchEnd += len(originalLines[i+k])
+				if k < len(searchLines)-1 {
+					matchEnd += 1 // Add newline character except for the last line
+				}
+			}
+
+			actualMatch := content[matchStart:matchEnd]
+			return []string{actualMatch}
+		}
+	}
+
+	return []string{}
+}
+
+// WhitespaceNormalizedReplacer normalizes whitespace before matching
+type WhitespaceNormalizedReplacer struct{}
+
+func (r *WhitespaceNormalizedReplacer) FindMatches(content, find string) []string {
+	normalizeWhitespace := func(text string) string {
+		return regexp.MustCompile(`\s+`).ReplaceAllString(strings.TrimSpace(text), " ")
+	}
+
+	normalizedFind := normalizeWhitespace(find)
+	var matches []string
+
+	// Handle single line matches
+	lines := strings.Split(content, "\n")
+	for _, line := range lines {
+		if normalizeWhitespace(line) == normalizedFind {
+			matches = append(matches, line)
+		}
+	}
+
+	// Handle multi-line matches
+	findLines := strings.Split(find, "\n")
+	if len(findLines) > 1 {
+		for i := 0; i <= len(lines)-len(findLines); i++ {
+			block := strings.Join(lines[i:i+len(findLines)], "\n")
+			if normalizeWhitespace(block) == normalizedFind {
+				matches = append(matches, block)
+			}
+		}
+	}
+
+	return matches
+}
+
+// IndentationFlexibleReplacer ignores indentation differences
+type IndentationFlexibleReplacer struct{}
+
+func (r *IndentationFlexibleReplacer) FindMatches(content, find string) []string {
+	removeIndentation := func(text string) string {
+		lines := strings.Split(text, "\n")
+		nonEmptyLines := []string{}
+		for _, line := range lines {
+			if strings.TrimSpace(line) != "" {
+				nonEmptyLines = append(nonEmptyLines, line)
+			}
+		}
+
+		if len(nonEmptyLines) == 0 {
+			return text
+		}
+
+		minIndent := len(nonEmptyLines[0]) // Start with max possible
+		for _, line := range nonEmptyLines {
+			leadingSpaces := 0
+			for _, char := range line {
+				if char == ' ' || char == '\t' {
+					leadingSpaces++
+				} else {
+					break
+				}
+			}
+			if leadingSpaces < minIndent {
+				minIndent = leadingSpaces
+			}
+		}
+
+		result := []string{}
+		for _, line := range lines {
+			if strings.TrimSpace(line) == "" {
+				result = append(result, line)
+			} else if len(line) > minIndent {
+				result = append(result, line[minIndent:])
+			} else {
+				result = append(result, line)
+			}
+		}
+
+		return strings.Join(result, "\n")
+	}
+
+	normalizedFind := removeIndentation(find)
+	contentLines := strings.Split(content, "\n")
+	findLines := strings.Split(find, "\n")
+
+	var matches []string
+	for i := 0; i <= len(contentLines)-len(findLines); i++ {
+		block := strings.Join(contentLines[i:i+len(findLines)], "\n")
+		if removeIndentation(block) == normalizedFind {
+			matches = append(matches, block)
+		}
+	}
+
+	return matches
+}
+
+// ReplaceInContent performs string replacement using multiple strategies
+func ReplaceInContent(content, oldString, newString string, replaceAll bool) (string, error) {
+	if oldString == newString {
+		return "", fmt.Errorf("oldString and newString must be different")
+	}
+
+	replacers := []Replacer{
+		&SimpleReplacer{},
+		&LineTrimmedReplacer{},
+		&WhitespaceNormalizedReplacer{},
+		&IndentationFlexibleReplacer{},
+	}
+
+	for _, replacer := range replacers {
+		matches := replacer.FindMatches(content, oldString)
+		for _, match := range matches {
+			// Check if the match appears only once (unless replaceAll is true)
+			if !replaceAll {
+				firstIndex := strings.Index(content, match)
+				lastIndex := strings.LastIndex(content, match)
+				if firstIndex != lastIndex {
+					continue // Multiple occurrences, skip this match
+				}
+			}
+
+			// Perform the replacement
+			if replaceAll {
+				return strings.ReplaceAll(content, match, newString), nil
+			}
+			return strings.Replace(content, match, newString, 1), nil
+		}
+	}
+
+	return "", fmt.Errorf("oldString not found in content or multiple ambiguous matches found")
+}
+
+// GenerateFocusedDiff generates a diff focused around the changed area
+func GenerateFocusedDiff(oldContent, newContent, filename, oldString, newString string) string {
+	var result strings.Builder
+	result.WriteString(fmt.Sprintf("📝 Incremental edit applied to: %s\n", filename))
+	result.WriteString("🔄 Changes:\n")
+	result.WriteString(fmt.Sprintf("  - Removed: %q\n", truncateString(oldString, 80)))
+	result.WriteString(fmt.Sprintf("  + Added: %q\n", truncateString(newString, 80)))
+
+	// Always show the context diff for incremental edits
+	result.WriteString("\n" + GenerateDiff(oldContent, newContent, filename))
+
+	return result.String()
+}
+
+// truncateString truncates a string to maxLength with ellipsis
+func truncateString(s string, maxLength int) string {
+	if len(s) <= maxLength {
+		return s
+	}
+	return s[:maxLength-3] + "..."
 }
