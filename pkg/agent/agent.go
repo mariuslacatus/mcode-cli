@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"coding-agent/pkg/config"
 	"coding-agent/pkg/project"
@@ -280,9 +281,11 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 			Messages:  messages,
 			Tools:     toolManager.GetToolDefinitions(),
 			MaxTokens: maxTokens,
+			Stream:    true, // Enable streaming
 		}
 
-		resp, err := a.Client.CreateChatCompletion(ctx, req)
+		// Create streaming request
+		stream, err := a.Client.CreateChatCompletionStream(ctx, req)
 		if err != nil {
 			// Check for context overflow or tool calling errors
 			errStr := err.Error()
@@ -303,7 +306,7 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 					fmt.Println("   Try switching to a more compatible model with: /models")
 				}
 
-				// Try with trimmed context and no tools as fallback
+				// Try with trimmed context and no tools as fallback (non-streaming)
 				reqFallback := openai.ChatCompletionRequest{
 					Model:     currentModel.Name,
 					Messages:  messages,
@@ -311,36 +314,220 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 				}
 
 				fmt.Println("🔄 Retrying with simplified request...")
-				resp, err = a.Client.CreateChatCompletion(ctx, reqFallback)
+				resp, err := a.Client.CreateChatCompletion(ctx, reqFallback)
 				if err != nil {
 					return fmt.Errorf("error calling API (even after fallback): %v", err)
 				}
+
+				// Handle non-streaming fallback response
+				a.LastTokenUsage = &resp.Usage
+				a.TotalTokensUsed += resp.Usage.TotalTokens
+
+				choice := resp.Choices[0]
+				assistantMessage := openai.ChatCompletionMessage{
+					Role:      openai.ChatMessageRoleAssistant,
+					Content:   choice.Message.Content,
+					ToolCalls: choice.Message.ToolCalls,
+				}
+
+				a.Conversation = append(a.Conversation, assistantMessage)
+
+				if choice.Message.Content != "" {
+					fmt.Print(choice.Message.Content)
+				}
+
+				// Check for tool calls in fallback response
+				if len(choice.Message.ToolCalls) > 0 {
+					if err := handleToolCalls(a, choice.Message.ToolCalls, toolManager); err != nil {
+						return err
+					}
+				} else {
+					break
+				}
+				continue
 			} else {
 				return fmt.Errorf("error calling API: %v", err)
 			}
 		}
+		defer stream.Close()
 
-		// Update token usage from API response
-		a.LastTokenUsage = &resp.Usage
-		a.TotalTokensUsed += resp.Usage.TotalTokens
+		// Process streaming response
+		var fullContent strings.Builder
+		var toolCalls []openai.ToolCall
+		var usage *openai.Usage
+		var streamingStarted bool
+		var spinnerShown bool
+		var spinnerDone chan bool
+		var spinnerCleared chan bool
 
-		choice := resp.Choices[0]
+		for {
+			response, err := stream.Recv()
+			if err != nil {
+				if err.Error() == "EOF" {
+					break
+				}
+				return fmt.Errorf("error receiving stream: %v", err)
+			}
+
+			if len(response.Choices) > 0 {
+				delta := response.Choices[0].Delta
+				
+				// Stream content as it arrives
+				if delta.Content != "" {
+					// Clear spinner if it's showing and text content arrives
+					if spinnerShown && spinnerDone != nil {
+						spinnerDone <- true
+						// Wait for spinner to be cleared before showing content
+						if spinnerCleared != nil {
+							<-spinnerCleared
+						}
+						close(spinnerDone)
+						spinnerDone = nil
+						spinnerShown = false
+					}
+					
+					if !streamingStarted {
+						streamingStarted = true
+					}
+					fmt.Print(delta.Content)
+					// Force immediate flush to ensure real-time streaming
+					os.Stdout.Sync()
+					fullContent.WriteString(delta.Content)
+				}
+
+				// Collect tool calls - show animated spinner when tool calls detected
+				if len(delta.ToolCalls) > 0 {
+					if !spinnerShown {
+						fmt.Print("\n")
+						spinnerDone = make(chan bool)
+						spinnerCleared = make(chan bool)
+						go startSpinner(spinnerDone, spinnerCleared)
+						spinnerShown = true
+					}
+					
+					for _, toolCall := range delta.ToolCalls {
+						// Handle the fact that Index might be nil or a pointer
+						idx := 0
+						if toolCall.Index != nil {
+							idx = *toolCall.Index
+						}
+						
+						// Extend slice if needed
+						for len(toolCalls) <= idx {
+							toolCalls = append(toolCalls, openai.ToolCall{
+								Function: openai.FunctionCall{},
+							})
+						}
+						
+						// Accumulate tool call data
+						if toolCall.ID != "" {
+							toolCalls[idx].ID = toolCall.ID
+						}
+						if toolCall.Type != "" {
+							toolCalls[idx].Type = toolCall.Type
+						}
+						if toolCall.Function.Name != "" {
+							toolCalls[idx].Function.Name = toolCall.Function.Name
+						}
+						if toolCall.Function.Arguments != "" {
+							toolCalls[idx].Function.Arguments += toolCall.Function.Arguments
+						}
+					}
+				}
+			}
+
+			// Note: Usage information is typically only available in the final chunk
+			// for streaming responses, but some implementations may provide it elsewhere
+		}
+
+		// Stop spinner if it's still running
+		if spinnerShown && spinnerDone != nil {
+			spinnerDone <- true
+			if spinnerCleared != nil {
+				<-spinnerCleared
+			}
+			close(spinnerDone)
+		}
+
+		// Update token usage (streaming typically doesn't provide usage info)
+		// We'll estimate based on content length as a fallback
+		if usage != nil {
+			a.LastTokenUsage = usage
+			a.TotalTokensUsed += usage.TotalTokens
+		} else {
+			// Rough estimation: ~4 characters per token for response
+			responseTokens := len(fullContent.String()) / 4
+			if responseTokens < 1 {
+				responseTokens = 1
+			}
+			
+			// Estimate context tokens by looking at conversation history
+			contextEstimate := 0
+			for _, msg := range a.Conversation {
+				contextEstimate += len(msg.Content) / 4
+			}
+			
+			a.LastTokenUsage = &openai.Usage{
+				PromptTokens:     contextEstimate,
+				CompletionTokens: responseTokens,
+				TotalTokens:      contextEstimate + responseTokens,
+			}
+			a.TotalTokensUsed += responseTokens
+		}
+
+		// Show diff previews for edit_file tool calls immediately after streaming completes
+		// This creates a seamless experience by streaming the diff right after the LLM response
+		for _, toolCall := range toolCalls {
+			if toolCall.Function.Name == "edit_file" {
+				var params map[string]interface{}
+				if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &params); err == nil {
+					if pathParam, exists := params["path"]; exists {
+						if pathStr, ok := pathParam.(string); ok {
+							
+							if contentParam, exists := params["content"]; exists {
+								if contentStr, ok := contentParam.(string); ok {
+									// Read existing content for diff
+									var oldContent string
+									if existingContent, err := os.ReadFile(pathStr); err == nil {
+										oldContent = string(existingContent)
+									}
+									
+									// Generate and stream diff to simulate real-time streaming
+									if oldContent != contentStr {
+										diffHeader := fmt.Sprintf("\n\n📝 **Diff Preview for %s:**\n", pathStr)
+										fmt.Print(diffHeader)
+										os.Stdout.Sync()
+										fullContent.WriteString(diffHeader)
+										
+										diff := tools.GenerateDiff(oldContent, contentStr, pathStr)
+										// Stream the diff with simulated typing effect
+										streamDiff(diff, &fullContent)
+									} else {
+										noDiffMsg := fmt.Sprintf("\n\n📝 **No changes for %s**\n", pathStr)
+										fmt.Print(noDiffMsg)
+										os.Stdout.Sync()
+										fullContent.WriteString(noDiffMsg)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Create assistant message with accumulated content and tool calls
 		assistantMessage := openai.ChatCompletionMessage{
 			Role:      openai.ChatMessageRoleAssistant,
-			Content:   choice.Message.Content,
-			ToolCalls: choice.Message.ToolCalls,
+			Content:   fullContent.String(),
+			ToolCalls: toolCalls,
 		}
 
 		a.Conversation = append(a.Conversation, assistantMessage)
 
-		// Print the assistant's response
-		if choice.Message.Content != "" {
-			fmt.Print(choice.Message.Content)
-		}
-
 		// Check if the response contains tool calls
-		if len(choice.Message.ToolCalls) > 0 {
-			if err := handleToolCalls(a, choice.Message.ToolCalls, toolManager); err != nil {
+		if len(toolCalls) > 0 {
+			if err := handleToolCalls(a, toolCalls, toolManager); err != nil {
 				return err
 			}
 		} else {
@@ -368,49 +555,37 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 // handleToolCalls processes tool calls from the AI model
 func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *tools.Manager) error {
 	for _, toolCall := range toolCalls {
-		// Display tool call details
-		fmt.Printf("\n🔧 Tool Call: %s\n", toolCall.Function.Name)
-
 		var params map[string]interface{}
 		if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &params); err != nil {
 			fmt.Printf("Error parsing tool parameters: %v\n", err)
 			continue
 		}
 
-		// Show parameters nicely
-		for key, value := range params {
-			if toolCall.Function.Name == "edit_file" && key == "content" {
-				// For edit_file, show a diff preview instead of raw content
-				if pathParam, exists := params["path"]; exists {
-					if pathStr, ok := pathParam.(string); ok {
-						if contentStr, ok := value.(string); ok {
-							// Read existing content for diff
-							var oldContent string
-							if existingContent, err := os.ReadFile(pathStr); err == nil {
-								oldContent = string(existingContent)
-							}
-							
-							// Generate and display diff preview
-							if oldContent != contentStr {
-								fmt.Printf("   %s: <showing diff preview>\n", key)
-								diff := tools.GenerateDiff(oldContent, contentStr, pathStr)
-								fmt.Print(diff)
-							} else {
-								fmt.Printf("   %s: <no changes>\n", key)
-							}
-						} else {
-							fmt.Printf("   %s: <content>\n", key)
-						}
-					} else {
-						fmt.Printf("   %s: <content>\n", key)
-					}
-				} else {
-					fmt.Printf("   %s: <content>\n", key)
-				}
-			} else {
-				fmt.Printf("   %s: %v\n", key, value)
+		// Display condensed tool call format with useful parameters
+		toolDisplay := fmt.Sprintf("🔧 %s%s%s", types.ColorCyan, toolCall.Function.Name, types.ColorReset)
+		
+		// Add relevant parameters for different tools
+		switch toolCall.Function.Name {
+		case "read_file", "edit_file", "preview_edit":
+			if path, exists := params["path"]; exists {
+				toolDisplay += fmt.Sprintf(" <%v>", path)
+			}
+		case "list_files":
+			if path, exists := params["path"]; exists {
+				toolDisplay += fmt.Sprintf(" <%v>", path)
+			}
+		case "bash_command":
+			if command, exists := params["command"]; exists {
+				cmdStr := fmt.Sprintf("%v", command)
+				toolDisplay += fmt.Sprintf(" `%s`", cmdStr)
+			}
+		case "search_code":
+			if pattern, exists := params["pattern"]; exists {
+				toolDisplay += fmt.Sprintf(" \"%v\"", pattern)
 			}
 		}
+		
+		fmt.Printf("\n%s\n", toolDisplay)
 
 		// Check if this looks like a long-running command
 		isLongRunning := false
@@ -461,13 +636,6 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 		if shouldAutoExecute {
 			// Auto-execute approved folder operations
 			response = "y"
-			if toolCall.Function.Name == "list_files" {
-				fmt.Printf("📁 Listing files (auto-approved folder)\n")
-			} else if toolCall.Function.Name == "read_file" {
-				fmt.Printf("📖 Reading file (auto-approved folder)\n")
-			} else if toolCall.Function.Name == "preview_edit" {
-				fmt.Printf("👀 Previewing file changes (auto-approved folder)\n")
-			}
 		} else {
 			// Ask for confirmation for other operations
 			prompt := "\n❓ Execute this tool? (Y/n/s to skip/i to interrupt): "
@@ -543,7 +711,6 @@ func executeToolBasedOnResponse(a *types.Agent, response string, toolCall openai
 			if err != nil {
 				result = fmt.Sprintf("Error: %v", err)
 			}
-			fmt.Printf("✅ Tool executed successfully\n")
 		}
 	} else if response == "s" || response == "skip" {
 		result = "Tool execution skipped by user"
@@ -591,4 +758,49 @@ func executeToolBasedOnResponse(a *types.Agent, response string, toolCall openai
 	}
 
 	return result, true
+}
+
+// startSpinner shows an animated spinner until stopped
+func startSpinner(done chan bool, cleared chan bool) {
+	spinnerChars := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	i := 0
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-done:
+			// Clear the spinner completely
+			fmt.Print("\r\033[K") // Clear current line entirely
+			os.Stdout.Sync()
+			if cleared != nil {
+				cleared <- true // Signal that spinner is cleared
+			}
+			return
+		case <-ticker.C:
+			fmt.Printf("\r%s ", spinnerChars[i%len(spinnerChars)])
+			os.Stdout.Sync()
+			i++
+		}
+	}
+}
+
+// streamDiff simulates streaming output for diff content
+func streamDiff(diff string, fullContent *strings.Builder) {
+	// Stream the diff in small chunks to simulate real streaming like Claude Code
+	chunkSize := 3 // Stream a few characters at a time
+	for i := 0; i < len(diff); i += chunkSize {
+		end := i + chunkSize
+		if end > len(diff) {
+			end = len(diff)
+		}
+		
+		chunk := diff[i:end]
+		fmt.Print(chunk)
+		os.Stdout.Sync() // Force immediate flush after each chunk
+		fullContent.WriteString(chunk)
+		
+		// Small delay to simulate streaming - faster than character by character
+		time.Sleep(2 * time.Millisecond)
+	}
 }

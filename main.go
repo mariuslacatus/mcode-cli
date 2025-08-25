@@ -34,7 +34,30 @@ func main() {
 	projectManager := project.NewManager(ag)
 	commandHandler := commands.NewHandler(ag, projectManager)
 
-	// Clear terminal on startup
+	// Check if we have command line arguments for single command mode
+	if len(os.Args) > 1 {
+		// Join all arguments as the message
+		message := strings.Join(os.Args[1:], " ")
+		
+		// Get current model info for display
+		currentModel, exists := ag.Config.Models[ag.Config.CurrentModel]
+		if !exists {
+			currentModel = types.Model{Name: "unknown", BaseURL: "unknown"}
+		}
+		
+		fmt.Printf("MCode CLI - Connected to %s\n", currentModel.BaseURL)
+		fmt.Printf("Model: %s (%s)\n", currentModel.Name, ag.Config.CurrentModel)
+		fmt.Printf("Query: %s\n\n", message)
+		
+		// Execute the single command and exit
+		if err := agent.Chat(ag, ctx, message); err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Clear terminal on startup for interactive mode
 	fmt.Print("\033[2J\033[H")
 
 	// Get current model info for display
