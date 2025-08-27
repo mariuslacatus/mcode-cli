@@ -15,6 +15,7 @@ import (
 	"coding-agent/pkg/project"
 	"coding-agent/pkg/tools"
 	"coding-agent/pkg/types"
+
 	"github.com/sashabaranov/go-openai"
 )
 
@@ -258,23 +259,9 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 
 		// Check if context is getting too large and trim if needed
 		messages := a.Conversation
-		if a.LastTokenUsage != nil && a.LastTokenUsage.PromptTokens > 25000 {
-			fmt.Printf("⚠️  Context getting large (%d tokens), trimming older messages...\n", a.LastTokenUsage.PromptTokens)
-			messages = TrimContext(a, a.Conversation)
-		}
 
-		// Calculate appropriate MaxTokens based on context usage
-		maxTokens := 8000
-		if a.LastTokenUsage != nil {
-			contextTokens := a.LastTokenUsage.PromptTokens
-			remainingTokens := 32000 - contextTokens - 1000 // 1k safety buffer
-			if remainingTokens < maxTokens {
-				maxTokens = remainingTokens
-				if maxTokens < 1000 {
-					maxTokens = 1000 // Minimum usable response size
-				}
-			}
-		}
+		// Use a reasonable default max tokens without context window restrictions
+		maxTokens := 40000
 
 		req := openai.ChatCompletionRequest{
 			Model:     currentModel.Name,
@@ -371,7 +358,7 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 
 			if len(response.Choices) > 0 {
 				delta := response.Choices[0].Delta
-				
+
 				// Stream content as it arrives
 				if delta.Content != "" {
 					// Clear spinner if it's showing and text content arrives
@@ -385,7 +372,7 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 						spinnerDone = nil
 						spinnerShown = false
 					}
-					
+
 					if !streamingStarted {
 						streamingStarted = true
 					}
@@ -404,21 +391,21 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 						go startSpinner(spinnerDone, spinnerCleared)
 						spinnerShown = true
 					}
-					
+
 					for _, toolCall := range delta.ToolCalls {
 						// Handle the fact that Index might be nil or a pointer
 						idx := 0
 						if toolCall.Index != nil {
 							idx = *toolCall.Index
 						}
-						
+
 						// Extend slice if needed
 						for len(toolCalls) <= idx {
 							toolCalls = append(toolCalls, openai.ToolCall{
 								Function: openai.FunctionCall{},
 							})
 						}
-						
+
 						// Accumulate tool call data
 						if toolCall.ID != "" {
 							toolCalls[idx].ID = toolCall.ID
@@ -460,13 +447,13 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 			if responseTokens < 1 {
 				responseTokens = 1
 			}
-			
+
 			// Estimate context tokens by looking at conversation history
 			contextEstimate := 0
 			for _, msg := range a.Conversation {
 				contextEstimate += len(msg.Content) / 4
 			}
-			
+
 			a.LastTokenUsage = &openai.Usage{
 				PromptTokens:     contextEstimate,
 				CompletionTokens: responseTokens,
@@ -492,17 +479,17 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 							pathStr = p
 						}
 					}
-					
+
 					if pathStr != "" {
 						// Read existing content
 						var oldContent string
 						if existingContent, err := os.ReadFile(pathStr); err == nil {
 							oldContent = string(existingContent)
 						}
-						
+
 						var newContent string
 						var editType string
-						
+
 						// Check for incremental edit (OpenCode style: oldString + newString)
 						if oldString, hasOld := params["oldString"]; hasOld {
 							if oldStr, ok := oldString.(string); ok {
@@ -534,7 +521,7 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 								editType = "FULL REPLACEMENT"
 							}
 						}
-						
+
 						// Generate and stream diff if content changes
 						if newContent != "" && oldContent != newContent {
 							var diffHeader string
@@ -548,7 +535,7 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 							fmt.Print(diffHeader)
 							os.Stdout.Sync()
 							fullContent.WriteString(diffHeader)
-							
+
 							diff := tools.GenerateDiff(oldContent, newContent, pathStr)
 							// Stream the diff with simulated typing effect
 							streamDiff(diff, &fullContent)
@@ -610,7 +597,7 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 
 		// Display condensed tool call format with useful parameters
 		toolDisplay := fmt.Sprintf("🔧 %s%s%s", types.ColorCyan, toolCall.Function.Name, types.ColorReset)
-		
+
 		// Add relevant parameters for different tools
 		switch toolCall.Function.Name {
 		case "read_file", "preview_edit":
@@ -625,7 +612,7 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 			} else if oldPath, exists := params["path"]; exists {
 				path = fmt.Sprintf("%v", oldPath)
 			}
-			
+
 			// Show the mode being used
 			if oldString, hasOld := params["oldString"]; hasOld && oldString != "" {
 				// Incremental mode - FAST!
@@ -651,7 +638,7 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 				toolDisplay += fmt.Sprintf(" \"%v\"", pattern)
 			}
 		}
-		
+
 		fmt.Printf("\n%s\n", toolDisplay)
 
 		// Check if this looks like a long-running command
@@ -861,12 +848,12 @@ func streamDiff(diff string, fullContent *strings.Builder) {
 		if end > len(diff) {
 			end = len(diff)
 		}
-		
+
 		chunk := diff[i:end]
 		fmt.Print(chunk)
 		os.Stdout.Sync() // Force immediate flush after each chunk
 		fullContent.WriteString(chunk)
-		
+
 		// Small delay to simulate streaming - faster than character by character
 		time.Sleep(2 * time.Millisecond)
 	}
