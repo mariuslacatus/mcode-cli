@@ -33,6 +33,7 @@ func (m *Manager) RegisterTools() {
 	m.agent.Tools["list_files"] = m.ListFiles
 	m.agent.Tools["bash_command"] = m.BashCommand
 	m.agent.Tools["edit_file"] = m.EditFile
+	m.agent.Tools["write_file"] = m.WriteFile
 	m.agent.Tools["search_code"] = m.SearchCode
 }
 
@@ -116,6 +117,27 @@ func (m *Manager) GetToolDefinitions() []openai.Tool {
 						},
 					},
 					"required": []string{"filePath", "newString"},
+				},
+			},
+		},
+		{
+			Type: openai.ToolTypeFunction,
+			Function: &openai.FunctionDefinition{
+				Name:        "write_file",
+				Description: "Write content to a file. This creates a new file or overwrites an existing one. Use this when you want to completely replace a file's contents.",
+				Parameters: map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"path": map[string]interface{}{
+							"type":        "string",
+							"description": "The absolute path to the file to write",
+						},
+						"content": map[string]interface{}{
+							"type":        "string",
+							"description": "The content to write to the file",
+						},
+					},
+					"required": []string{"path", "content"},
 				},
 			},
 		},
@@ -343,6 +365,54 @@ func (m *Manager) EditFile(params map[string]interface{}) (string, error) {
 	}
 
 	return "", fmt.Errorf("either newString (for new files) or oldString+newString (for edits) or content (for full replacement) must be provided")
+}
+
+// WriteFile writes content to a file, creating it if it doesn't exist or overwriting if it does.
+// This is a simpler, more direct alternative to edit_file for complete file replacements.
+func (m *Manager) WriteFile(params map[string]interface{}) (string, error) {
+	path, ok := params["path"].(string)
+	if !ok {
+		return "", fmt.Errorf("path parameter is required")
+	}
+
+	content, ok := params["content"].(string)
+	if !ok {
+		return "", fmt.Errorf("content parameter is required")
+	}
+
+	// Check if file exists to determine if we're creating or overwriting
+	var oldContent string
+	if _, err := os.Stat(path); err == nil {
+		// File exists, read it for comparison
+		existingContent, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("error reading existing file: %v", err)
+		}
+		oldContent = string(existingContent)
+	}
+
+	// Write the new content
+	err := os.WriteFile(path, []byte(content), 0644)
+	if err != nil {
+		return "", fmt.Errorf("error writing file: %v", err)
+	}
+
+	// Return appropriate message
+	if oldContent == "" {
+		return fmt.Sprintf("✅ File created: %s\n%s", path, truncatePreview(content, 200)), nil
+	} else if oldContent != content {
+		return fmt.Sprintf("✅ File overwritten: %s\n%s", path, truncatePreview(content, 200)), nil
+	}
+
+	return fmt.Sprintf("✅ File unchanged: %s", path), nil
+}
+
+// truncatePreview truncates content for display in the response
+func truncatePreview(content string, maxLength int) string {
+	if len(content) <= maxLength {
+		return content
+	}
+	return content[:maxLength-3] + "..."
 }
 
 // performIncrementalEdit handles incremental file editing
