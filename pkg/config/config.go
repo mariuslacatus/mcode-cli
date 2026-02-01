@@ -36,6 +36,10 @@ func LoadOrCreateConfig(configPath string) (*types.Config, error) {
 				Name:    "lmstudio-community/qwen3-coder-30b-a3b-instruct-mlx@8bit",
 				BaseURL: "http://localhost:1234/v1",
 			},
+			"GLM-4.7-flash": {
+				Name:    "zai-org/glm-4.7-flash",
+				BaseURL: "http://localhost:1234/v1",
+			},
 			"hermes-3": {
 				Name:    "NousResearch/Hermes-3-Llama-3.1-8B-GGUF",
 				BaseURL: "http://localhost:1234/v1",

@@ -11,7 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/term"
+
 	"coding-agent/pkg/config"
+	"coding-agent/pkg/markdown"
 	"coding-agent/pkg/project"
 	"coding-agent/pkg/tools"
 	"coding-agent/pkg/types"
@@ -338,11 +341,13 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 		}
 		defer stream.Close()
 
+		// Save cursor position removed - using calculated height for clearing
+
 		// Process streaming response
 		var fullContent strings.Builder
 		var toolCalls []openai.ToolCall
-		var usage *openai.Usage
-		var streamingStarted bool
+
+		// Spinner for tool calls
 		var spinnerShown bool
 		var spinnerDone chan bool
 		var spinnerCleared chan bool
@@ -361,25 +366,10 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 
 				// Stream content as it arrives
 				if delta.Content != "" {
-					// Clear spinner if it's showing and text content arrives
-					if spinnerShown && spinnerDone != nil {
-						spinnerDone <- true
-						// Wait for spinner to be cleared before showing content
-						if spinnerCleared != nil {
-							<-spinnerCleared
-						}
-						close(spinnerDone)
-						spinnerDone = nil
-						spinnerShown = false
-					}
-
-					if !streamingStarted {
-						streamingStarted = true
-					}
-					fmt.Print(delta.Content)
-					// Force immediate flush to ensure real-time streaming
-					os.Stdout.Sync()
 					fullContent.WriteString(delta.Content)
+
+					// Print raw content as it comes in
+					fmt.Print(delta.Content)
 				}
 
 				// Collect tool calls - show animated spinner when tool calls detected
@@ -436,119 +426,68 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 			close(spinnerDone)
 		}
 
-		// Update token usage (streaming typically doesn't provide usage info)
-		// We'll estimate based on content length as a fallback
-		if usage != nil {
-			a.LastTokenUsage = usage
-			a.TotalTokensUsed += usage.TotalTokens
-		} else {
-			// Rough estimation: ~4 characters per token for response
-			responseTokens := len(fullContent.String()) / 4
-			if responseTokens < 1 {
-				responseTokens = 1
-			}
+		// Replace the raw output with rendered markdown
 
-			// Estimate context tokens by looking at conversation history
-			contextEstimate := 0
-			for _, msg := range a.Conversation {
-				contextEstimate += len(msg.Content) / 4
-			}
-
-			a.LastTokenUsage = &openai.Usage{
-				PromptTokens:     contextEstimate,
-				CompletionTokens: responseTokens,
-				TotalTokens:      contextEstimate + responseTokens,
-			}
-			a.TotalTokensUsed += responseTokens
+		// Calculate lines to clear safely
+		width, _, err := term.GetSize(int(os.Stdout.Fd()))
+		if err != nil {
+			width = 80
 		}
 
-		// Show diff previews for edit_file tool calls immediately after streaming completes
-		// This creates a seamless experience by streaming the diff right after the LLM response
-		for _, toolCall := range toolCalls {
-			if toolCall.Function.Name == "edit_file" {
-				var params map[string]interface{}
-				if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &params); err == nil {
-					// Handle both old and new parameter names
-					var pathStr string
-					if filePath, exists := params["filePath"]; exists {
-						if fp, ok := filePath.(string); ok {
-							pathStr = fp
-						}
-					} else if path, exists := params["path"]; exists {
-						if p, ok := path.(string); ok {
-							pathStr = p
-						}
-					}
-
-					if pathStr != "" {
-						// Read existing content
-						var oldContent string
-						if existingContent, err := os.ReadFile(pathStr); err == nil {
-							oldContent = string(existingContent)
-						}
-
-						var newContent string
-						var editType string
-
-						// Check for incremental edit (OpenCode style: oldString + newString)
-						if oldString, hasOld := params["oldString"]; hasOld {
-							if oldStr, ok := oldString.(string); ok {
-								if newString, hasNew := params["newString"]; hasNew {
-									if newStr, ok := newString.(string); ok {
-										// Simulate incremental replacement for preview
-										if oldStr == "" {
-											// New file creation
-											newContent = newStr
-											editType = "NEW FILE"
-										} else {
-											// Incremental edit - do the replacement for preview
-											newContent = strings.Replace(oldContent, oldStr, newStr, 1)
-											editType = "INCREMENTAL"
-										}
-									}
-								}
-							}
-						} else if newString, hasNew := params["newString"]; hasNew {
-							// New file with just newString
-							if newStr, ok := newString.(string); ok {
-								newContent = newStr
-								editType = "NEW FILE"
-							}
-						} else if content, exists := params["content"]; exists {
-							// Legacy full replacement
-							if contentStr, ok := content.(string); ok {
-								newContent = contentStr
-								editType = "FULL REPLACEMENT"
-							}
-						}
-
-						// Generate and stream diff if content changes
-						if newContent != "" && oldContent != newContent {
-							var diffHeader string
-							if editType == "INCREMENTAL" {
-								diffHeader = fmt.Sprintf("\n\n📝 **🚀 Incremental Edit Preview for %s:**\n", pathStr)
-							} else if editType == "NEW FILE" {
-								diffHeader = fmt.Sprintf("\n\n📝 **🚀 New File Preview for %s:**\n", pathStr)
-							} else {
-								diffHeader = fmt.Sprintf("\n\n📝 **📄 Full Replacement Preview for %s:**\n", pathStr)
-							}
-							fmt.Print(diffHeader)
-							os.Stdout.Sync()
-							fullContent.WriteString(diffHeader)
-
-							diff := tools.GenerateDiff(oldContent, newContent, pathStr)
-							// Stream the diff with simulated typing effect
-							streamDiff(diff, &fullContent)
-						} else if newContent == oldContent {
-							noDiffMsg := fmt.Sprintf("\n\n📝 **No changes for %s**\n", pathStr)
-							fmt.Print(noDiffMsg)
-							os.Stdout.Sync()
-							fullContent.WriteString(noDiffMsg)
-						}
-					}
+		lines := 0
+		curWidth := 0
+		for _, r := range fullContent.String() {
+			if r == '\n' {
+				lines++
+				curWidth = 0
+			} else {
+				if curWidth >= width {
+					lines++
+					curWidth = 0
 				}
+				curWidth++
 			}
 		}
+
+		// Clear the raw output
+		if lines > 0 {
+			fmt.Printf("\033[%dA", lines) // Move cursor up
+		}
+		fmt.Print("\r\033[J") // Clear from cursor down
+
+		// Render the full content
+		if fullContent.Len() > 0 {
+			renderer, err := markdown.NewTermRenderer()
+			if err == nil {
+				rendered, err := renderer.Render(fullContent.String())
+				if err == nil {
+					fmt.Print(rendered)
+				} else {
+					fmt.Print(fullContent.String())
+				}
+			} else {
+				fmt.Print(fullContent.String())
+			}
+		}
+
+		// Rough estimation: ~4 characters per token for response
+		responseTokens := len(fullContent.String()) / 4
+		if responseTokens < 1 {
+			responseTokens = 1
+		}
+
+		// Estimate context tokens by looking at conversation history
+		contextEstimate := 0
+		for _, msg := range a.Conversation {
+			contextEstimate += len(msg.Content) / 4
+		}
+
+		a.LastTokenUsage = &openai.Usage{
+			PromptTokens:     contextEstimate,
+			CompletionTokens: responseTokens,
+			TotalTokens:      contextEstimate + responseTokens,
+		}
+		a.TotalTokensUsed += responseTokens
 
 		// Create assistant message with accumulated content and tool calls
 		assistantMessage := openai.ChatCompletionMessage{
