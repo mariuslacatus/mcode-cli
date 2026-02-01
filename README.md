@@ -1,6 +1,6 @@
 # MCode CLI
 
-A Go-based coding agent that uses LM Studio locally with Qwen3 Coder to help with programming tasks through a command-line interface.
+A Go-based coding agent that uses LM Studio locally to help with programming tasks through a command-line interface.
 
 ## Features
 
@@ -11,8 +11,9 @@ Based on the principles from the referenced articles, this agent implements:
   1. `read_file` - Read file contents
   2. `list_files` - List directory contents  
   3. `bash_command` - Execute shell commands
+  5. `write_file` - Create/overwrite files
   4. `edit_file` - Create/modify files
-  5. `search_code` - Search for code patterns
+  6. `search_code` - Search for code patterns
 - **Local Model**: Uses `lmstudio-community/qwen3-coder-30b-a3b-instruct-mlx@8bit`
 
 ## Prerequisites
@@ -31,21 +32,21 @@ go mod tidy
 
 2. Build the agent:
 ```bash
-go build -o mcode-cli
+go build -o mcode
 ```
 
 ## Usage
 
 ### Interactive Mode
 ```bash
-./mcode-cli
+./mcode
 ```
 
 ### Single Command Mode  
 ```bash
-./mcode-cli "List all Go files in the current directory"
-./mcode-cli "Create a simple HTTP server in Go"
-./mcode-cli "Find all TODO comments in the code"
+./mcode "List all Go files in the current directory"
+./mcode "Create a simple HTTP server in Go"
+./mcode "Find all TODO comments in the code"
 ```
 
 ## Examples
@@ -78,5 +79,9 @@ Each tool interaction includes the full conversation history, allowing the Qwen3
 
 - `/init` - Initialize project and create AGENTS.md documentation
 - `/new` - Clear conversation context (start fresh session)
+- `/export` - Export conversation context to text file
+- `/models` - List or switch between available models
+- `/permissions` - Manage folder permissions
+- `/compact` - Compact conversation context to save tokens
 - `/exit` - Exit the agent gracefully  
 - `/help` - Show available commands and usage
