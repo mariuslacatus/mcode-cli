@@ -730,9 +730,15 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 
 		// Add relevant parameters for different tools
 		switch toolCall.Function.Name {
-		case "read_file", "preview_edit":
+		case "read_file", "preview_edit", "write_file":
 			if path, exists := params["path"]; exists {
-				toolDisplay += fmt.Sprintf(" <%v>", path)
+				absPath := fmt.Sprintf("%v", path)
+				relPath, err := filepath.Rel(".", absPath)
+				if err == nil {
+					toolDisplay += fmt.Sprintf(" <%s>", relPath)
+				} else {
+					toolDisplay += fmt.Sprintf(" <%s>", absPath)
+				}
 			}
 		case "edit_file":
 			// Handle both old and new parameter names
@@ -741,6 +747,12 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 				path = fmt.Sprintf("%v", filePath)
 			} else if oldPath, exists := params["path"]; exists {
 				path = fmt.Sprintf("%v", oldPath)
+			}
+
+			// Use relative path for display
+			relPath, err := filepath.Rel(".", path)
+			if err == nil {
+				path = relPath
 			}
 
 			// Show the mode being used
@@ -756,7 +768,13 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 			}
 		case "list_files":
 			if path, exists := params["path"]; exists {
-				toolDisplay += fmt.Sprintf(" <%v>", path)
+				absPath := fmt.Sprintf("%v", path)
+				relPath, err := filepath.Rel(".", absPath)
+				if err == nil {
+					toolDisplay += fmt.Sprintf(" <%s>", relPath)
+				} else {
+					toolDisplay += fmt.Sprintf(" <%s>", absPath)
+				}
 			}
 		case "bash_command":
 			if command, exists := params["command"]; exists {
