@@ -880,12 +880,13 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 
 		// Display tool output to user
 		if result != "" && (response == "" || response == "y" || response == "yes" || response == "b" || response == "background") {
+			fmt.Println() // Add blank line after tool call
 			if toolCall.Function.Name == "edit_file" {
 				// Stream diffs for nice effect
 				streamOutput(result)
 			} else if toolCall.Function.Name != "read_file" && toolCall.Function.Name != "list_files" && toolCall.Function.Name != "bash_command" {
 				// Generic output display (skip read_file, list_files, and bash_command to avoid clutter/duplication)
-				fmt.Printf("\n%s> Tool Output:%s\n", types.ColorCyan, types.ColorReset)
+				fmt.Printf("%s> Tool Output:%s\n", types.ColorCyan, types.ColorReset)
 				if len(result) > 2000 {
 					fmt.Println(result[:2000] + "... (truncated)")
 				} else {
