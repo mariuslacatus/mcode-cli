@@ -218,6 +218,191 @@ func TrimContext(a *types.Agent, messages []openai.ChatCompletionMessage) []open
 	return trimmed
 }
 
+// CompactContext uses the LLM to summarize the conversation history
+func CompactContext(a *types.Agent) error {
+	if len(a.Conversation) <= 4 {
+		return fmt.Errorf("conversation too short to compact")
+	}
+
+	fmt.Printf("\n🗜️  Compacting conversation context... please wait\n")
+
+	// Identify what to keep and what to summarize
+	// Keep system message
+	var systemMessages []openai.ChatCompletionMessage
+	// Keep last few messages to maintain immediate flow
+	var recentMessages []openai.ChatCompletionMessage
+	// Messages to summarize
+	var toSummarize []openai.ChatCompletionMessage
+
+	// Separate messages
+	conversationLen := len(a.Conversation)
+	keepRecent := 4
+
+	for i, msg := range a.Conversation {
+		if msg.Role == openai.ChatMessageRoleSystem {
+			systemMessages = append(systemMessages, msg)
+		} else if i >= conversationLen-keepRecent {
+			recentMessages = append(recentMessages, msg)
+		} else {
+			// Don't summarize other system messages if they exist in middle (rare but possible)
+			if msg.Role != openai.ChatMessageRoleSystem {
+				toSummarize = append(toSummarize, msg)
+			}
+		}
+	}
+
+	if len(toSummarize) == 0 {
+		return fmt.Errorf("no messages to compact")
+	}
+
+	// Create a summarization prompt
+	summaryPrompt := "Please provide a detailed, technical summary of the above conversation. \n" +
+		"Focus on preserving context relevant to the current coding goal. \n" +
+		"You may discard code snippets or details that are no longer relevant to the current task. \n" +
+		"Preserve key technical decisions and any active constraints or instructions."
+
+	// Create a temporary conversation for the summarizer model
+	summaryConv := append([]openai.ChatCompletionMessage{}, toSummarize...)
+	summaryConv = append(summaryConv, openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: summaryPrompt,
+	})
+
+	// Use the current model for summarization
+	// Get current model configuration
+	currentModel, exists := a.Config.Models[a.Config.CurrentModel]
+	if !exists {
+		// Fallback to finding any model
+		for _, m := range a.Config.Models {
+			currentModel = m
+			break
+		}
+	}
+
+	req := openai.ChatCompletionRequest{
+		Model:     currentModel.Name,
+		Messages:  summaryConv,
+		MaxTokens: 4000, // Allow decent size for detailed summary
+		Stream:    true,
+	}
+
+	// Execute request with streaming
+	stream, err := a.Client.CreateChatCompletionStream(context.Background(), req)
+	if err != nil {
+		return fmt.Errorf("failed to start summary stream: %v", err)
+	}
+	defer stream.Close()
+
+	var summaryBuilder strings.Builder
+	fmt.Print(types.ColorCyan) // Use cyan for summary generation
+
+	for {
+		response, err := stream.Recv()
+		if err != nil {
+			if err.Error() == "EOF" {
+				break
+			}
+			return fmt.Errorf("error receiving summary stream: %v", err)
+		}
+
+		if len(response.Choices) > 0 {
+			content := response.Choices[0].Delta.Content
+			if content != "" {
+				fmt.Print(content)
+				summaryBuilder.WriteString(content)
+			}
+		}
+	}
+
+	fmt.Print(types.ColorReset) // Reset color
+	fmt.Println()               // Newline after summary
+
+	summaryContent := summaryBuilder.String()
+
+	// Construct new conversation history
+	var newHistory []openai.ChatCompletionMessage
+	newHistory = append(newHistory, systemMessages...)
+	newHistory = append(newHistory, openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleSystem,
+		Content: fmt.Sprintf("For context, here is a detailed summary of the previous conversation history:\n\n%s", summaryContent),
+	})
+	newHistory = append(newHistory, recentMessages...)
+
+	// Update agent state
+	oldLen := len(a.Conversation)
+	a.Conversation = newHistory
+
+	// Print clear success message
+	// Calculate new token estimate
+	newTokens := 0
+	for _, msg := range newHistory {
+		newTokens += len(msg.Content) / 4
+	}
+
+	// Print clear success message
+	fmt.Printf("✅ Context compacted: %d → %d messages (~%d tokens)\n", oldLen, len(a.Conversation), newTokens)
+
+	// Force update status display
+	UpdateStatusDisplay(a)
+
+	return nil
+}
+
+// UpdateStatusDisplay shows the current context size in the upper right
+// UpdateStatusDisplay updates the fixed header at the top of the terminal
+func UpdateStatusDisplay(a *types.Agent) {
+	// Calculate token count
+	tokens := GetContextTokens(a)
+
+	// Get terminal width
+	width, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil {
+		return // Can't get size, skip display
+	}
+
+	// Format portions of the header
+	modelInfo := fmt.Sprintf(" MCode | Model: %s ", a.Config.Models[a.Config.CurrentModel].Name)
+
+	usageStr := fmt.Sprintf(" %d tokens ", tokens)
+	if tokens >= 1000 {
+		usageStr = fmt.Sprintf(" %.1fk tokens ", float64(tokens)/1000.0)
+	}
+
+	// Color logic for token usage
+	usageColor := ""
+	if tokens > 25000 {
+		usageColor = types.ColorRed
+	} else if tokens > 10000 {
+		usageColor = types.ColorYellow
+	} else {
+		usageColor = types.ColorGreen
+	}
+
+	// Calculate padding to push usage to the right
+	paddingLen := width - len(modelInfo) - len(usageStr)
+	if paddingLen < 0 {
+		paddingLen = 0
+	}
+	padding := strings.Repeat(" ", paddingLen)
+
+	// Construct the full header line
+	// We use ANSI codes to:
+	// \0337   - Save cursor position
+	// \033[1;1H - Move to top-left (Row 1, Col 1)
+	// \033[7m - Inverse video (Make it look like a bar)
+	// ... print content ...
+	// \033[0m - Reset attributes
+	// \0338   - Restore cursor position
+
+	// Note: We don't apply inverse to the colored token count if we want the color to show up
+	// typically inverse + color interacts variously. Let's keep it simple:
+	// Inverse for the bar, but reset for the token count color?
+	// Actually, let's just use the UsageColor as the text color on the inverted background.
+
+	fmt.Printf("\0337\033[1;1H\033[7m%s%s%s%s%s\033[0m\0338",
+		modelInfo, padding, usageColor, usageStr, types.ColorReset)
+}
+
 // Chat handles conversation with the AI model
 func Chat(a *types.Agent, ctx context.Context, message string) error {
 	toolManager := tools.NewManager(a)
@@ -253,7 +438,19 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 		Content: message,
 	})
 
+	// Check if user requested compaction via command
+	if strings.TrimSpace(message) == "/compact" {
+		if err := CompactContext(a); err != nil {
+			return err
+		}
+		// Don't continue to LLM after strict command
+		return nil
+	}
+
 	for {
+		// Update status display before generating
+		UpdateStatusDisplay(a)
+
 		// Get current model name
 		currentModel, exists := a.Config.Models[a.Config.CurrentModel]
 		if !exists {
@@ -262,6 +459,34 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 
 		// Check if context is getting too large and trim if needed
 		messages := a.Conversation
+
+		// Auto-compaction check (approx 30k tokens)
+		// We use the last known token usage plus estimation
+		currentTokens := 0
+		if a.LastTokenUsage != nil {
+			currentTokens = a.LastTokenUsage.TotalTokens
+		}
+
+		// If we're over the limit, compact automatically
+		if currentTokens > 30000 {
+			spinnerDone := make(chan bool)
+			spinnerCleared := make(chan bool)
+			fmt.Printf("\n⚠️  Context limit reached (%d tokens). Auto-compacting...\n", currentTokens)
+			go startSpinner(spinnerDone, spinnerCleared)
+
+			err := CompactContext(a)
+
+			// Stop spinner
+			spinnerDone <- true
+			<-spinnerCleared
+
+			if err != nil {
+				fmt.Printf("Warning: Auto-compaction failed: %v\n", err)
+			} else {
+				// Update messages reference after compaction
+				messages = a.Conversation
+			}
+		}
 
 		// Use a reasonable default max tokens without context window restrictions
 		maxTokens := 40000
@@ -520,6 +745,9 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 			fmt.Printf("%s[Context: %d tokens | Response: %d tokens | Session: %d tokens]%s\n",
 				types.ColorBlue, contextTokens, responseTokens, totalSessionTokens, types.ColorReset)
 		}
+
+		// Update persistent status display
+		UpdateStatusDisplay(a)
 	}
 
 	return nil
@@ -650,6 +878,22 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 		// Execute tool based on response
 		result, shouldContinue := executeToolBasedOnResponse(a, response, toolCall, params, isLongRunning, toolManager)
 
+		// Display tool output to user
+		if result != "" && (response == "" || response == "y" || response == "yes" || response == "b" || response == "background") {
+			if toolCall.Function.Name == "edit_file" {
+				// Stream diffs for nice effect
+				streamOutput(result)
+			} else if toolCall.Function.Name != "read_file" && toolCall.Function.Name != "list_files" && toolCall.Function.Name != "bash_command" {
+				// Generic output display (skip read_file, list_files, and bash_command to avoid clutter/duplication)
+				fmt.Printf("\n%s> Tool Output:%s\n", types.ColorCyan, types.ColorReset)
+				if len(result) > 2000 {
+					fmt.Println(result[:2000] + "... (truncated)")
+				} else {
+					fmt.Println(result)
+				}
+			}
+		}
+
 		// Add tool result to conversation
 		a.Conversation = append(a.Conversation, openai.ChatCompletionMessage{
 			Role:       openai.ChatMessageRoleTool,
@@ -778,22 +1022,22 @@ func startSpinner(done chan bool, cleared chan bool) {
 	}
 }
 
-// streamDiff simulates streaming output for diff content
-func streamDiff(diff string, fullContent *strings.Builder) {
-	// Stream the diff in small chunks to simulate real streaming like Claude Code
-	chunkSize := 3 // Stream a few characters at a time
-	for i := 0; i < len(diff); i += chunkSize {
+// streamOutput simulates streaming output for content
+func streamOutput(content string) {
+	// Stream the content in small chunks
+	chunkSize := 10 // Larger chunk size for faster display
+	for i := 0; i < len(content); i += chunkSize {
 		end := i + chunkSize
-		if end > len(diff) {
-			end = len(diff)
+		if end > len(content) {
+			end = len(content)
 		}
 
-		chunk := diff[i:end]
+		chunk := content[i:end]
 		fmt.Print(chunk)
 		os.Stdout.Sync() // Force immediate flush after each chunk
-		fullContent.WriteString(chunk)
 
-		// Small delay to simulate streaming - faster than character by character
-		time.Sleep(2 * time.Millisecond)
+		// Very small delay
+		time.Sleep(1 * time.Millisecond)
 	}
+	fmt.Println() // Ensure newline at end
 }

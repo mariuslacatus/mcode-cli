@@ -11,6 +11,11 @@ import (
 	"coding-agent/pkg/commands"
 	"coding-agent/pkg/project"
 	"coding-agent/pkg/types"
+	"os/signal"
+	"syscall"
+
+	"golang.org/x/term"
+
 	"github.com/chzyer/readline"
 )
 
@@ -21,9 +26,19 @@ var completer = readline.NewPrefixCompleter(
 	readline.PcItem("/export"),
 	readline.PcItem("/models"),
 	readline.PcItem("/permissions"),
+	readline.PcItem("/compact"),
 	readline.PcItem("/exit"),
 	readline.PcItem("#"),
 )
+
+// getTerminalHeight returns the current terminal height
+func getTerminalHeight() int {
+	_, height, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil {
+		return 24 // Fallback
+	}
+	return height
+}
 
 func main() {
 	// Create agent instance
@@ -38,17 +53,17 @@ func main() {
 	if len(os.Args) > 1 {
 		// Join all arguments as the message
 		message := strings.Join(os.Args[1:], " ")
-		
+
 		// Get current model info for display
 		currentModel, exists := ag.Config.Models[ag.Config.CurrentModel]
 		if !exists {
 			currentModel = types.Model{Name: "unknown", BaseURL: "unknown"}
 		}
-		
+
 		fmt.Printf("MCode CLI - Connected to %s\n", currentModel.BaseURL)
 		fmt.Printf("Model: %s (%s)\n", currentModel.Name, ag.Config.CurrentModel)
 		fmt.Printf("Query: %s\n\n", message)
-		
+
 		// Execute the single command and exit
 		if err := agent.Chat(ag, ctx, message); err != nil {
 			fmt.Printf("Error: %v\n", err)
@@ -58,7 +73,29 @@ func main() {
 	}
 
 	// Clear terminal on startup for interactive mode
+	// Clear terminal on startup for interactive mode
 	fmt.Print("\033[2J\033[H")
+
+	// Setup sticky header
+	// 1. Set scrolling region to start at line 2 (preserve line 1)
+	fmt.Print("\033[2;r")
+	// 2. Move cursor to line 2
+	fmt.Print("\033[2;1H")
+
+	// Handle window resize (SIGWINCH) to reset scrolling region
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGWINCH)
+	go func() {
+		for range c {
+			// Re-apply scrolling region on resize
+			fmt.Print("\033[2;r")
+			// Redraw status immediately
+			agent.UpdateStatusDisplay(ag)
+		}
+	}()
+
+	// Ensure we reset terminal on exit
+	defer fmt.Print("\033[r")
 
 	// Get current model info for display
 	currentModel, exists := ag.Config.Models[ag.Config.CurrentModel]
@@ -85,6 +122,9 @@ func main() {
 	defer rl.Close()
 
 	for {
+		// Update status display
+		agent.UpdateStatusDisplay(ag)
+
 		// Update prompt with token count
 		tokens := agent.GetContextTokens(ag)
 		if tokens > 0 {

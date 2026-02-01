@@ -1,8 +1,10 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"coding-agent/pkg/types"
+
 	"github.com/sashabaranov/go-openai"
 )
 
@@ -198,17 +201,33 @@ func (m *Manager) BashCommand(params map[string]interface{}) (string, error) {
 	// Set process group so we can kill the entire group if needed
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	output, err := cmd.CombinedOutput()
+	// Capture stdout and stderr
+	var stdoutBuf, stderrBuf bytes.Buffer
+
+	// Create multi-writers to stream to stdout/stderr AND capture to buffers
+	cmd.Stdout = io.MultiWriter(os.Stdout, &stdoutBuf)
+	cmd.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
+
+	// Start the command
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("failed to start command: %v", err)
+	}
+
+	// Wait for the command to finish
+	err := cmd.Wait()
+
+	// Combine output
+	output := stdoutBuf.String() + stderrBuf.String()
 
 	if ctx.Err() == context.DeadlineExceeded {
-		return string(output), fmt.Errorf("command timed out after 30 seconds. Output so far: %s", string(output))
+		return output, fmt.Errorf("command timed out after 30 seconds. Output so far: %s", output)
 	}
 
 	if err != nil {
-		return string(output), fmt.Errorf("command failed: %v", err)
+		return output, fmt.Errorf("command failed: %v", err)
 	}
 
-	return string(output), nil
+	return output, nil
 }
 
 // BashCommandWithTimeout executes a bash command with a custom timeout

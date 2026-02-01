@@ -5,9 +5,11 @@ import (
 	"path/filepath"
 	"strings"
 
+	"coding-agent/pkg/agent"
 	"coding-agent/pkg/config"
 	"coding-agent/pkg/project"
 	"coding-agent/pkg/types"
+
 	"github.com/sashabaranov/go-openai"
 )
 
@@ -50,6 +52,9 @@ func (h *Handler) Handle(command string) (bool, error) {
 		return false, err
 	case "/permissions":
 		err := h.handlePermissionsCommand(parts)
+		return false, err
+	case "/compact":
+		err := agent.CompactContext(h.agent)
 		return false, err
 	case "/help":
 		h.showHelp()
@@ -235,6 +240,7 @@ func (h *Handler) showHelp() {
 	fmt.Println("  /export      - Export conversation context to text file")
 	fmt.Println("  /models      - List or switch between available models")
 	fmt.Println("  /permissions - Manage folder permissions")
+	fmt.Println("  /compact     - Compact conversation context to save tokens")
 	fmt.Println("  /exit        - Exit the agent")
 	fmt.Println("  /help        - Show this help message")
 	fmt.Println()
