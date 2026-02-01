@@ -354,53 +354,16 @@ func UpdateStatusDisplay(a *types.Agent) {
 	// Calculate token count
 	tokens := GetContextTokens(a)
 
-	// Get terminal width
-	width, _, err := term.GetSize(int(os.Stdout.Fd()))
-	if err != nil {
-		return // Can't get size, skip display
-	}
-
-	// Format portions of the header
-	modelInfo := fmt.Sprintf(" MCode | Model: %s ", a.Config.Models[a.Config.CurrentModel].Name)
-
-	usageStr := fmt.Sprintf(" %d tokens ", tokens)
+	// Format token string
+	usageStr := fmt.Sprintf("%d", tokens)
 	if tokens >= 1000 {
-		usageStr = fmt.Sprintf(" %.1fk tokens ", float64(tokens)/1000.0)
+		usageStr = fmt.Sprintf("%.1fk", float64(tokens)/1000.0)
 	}
 
-	// Color logic for token usage
-	usageColor := ""
-	if tokens > 25000 {
-		usageColor = types.ColorRed
-	} else if tokens > 10000 {
-		usageColor = types.ColorYellow
-	} else {
-		usageColor = types.ColorGreen
-	}
-
-	// Calculate padding to push usage to the right
-	paddingLen := width - len(modelInfo) - len(usageStr)
-	if paddingLen < 0 {
-		paddingLen = 0
-	}
-	padding := strings.Repeat(" ", paddingLen)
-
-	// Construct the full header line
-	// We use ANSI codes to:
-	// \0337   - Save cursor position
-	// \033[1;1H - Move to top-left (Row 1, Col 1)
-	// \033[7m - Inverse video (Make it look like a bar)
-	// ... print content ...
-	// \033[0m - Reset attributes
-	// \0338   - Restore cursor position
-
-	// Note: We don't apply inverse to the colored token count if we want the color to show up
-	// typically inverse + color interacts variously. Let's keep it simple:
-	// Inverse for the bar, but reset for the token count color?
-	// Actually, let's just use the UsageColor as the text color on the inverted background.
-
-	fmt.Printf("\0337\033[1;1H\033[7m%s%s%s%s%s\033[0m\0338",
-		modelInfo, padding, usageColor, usageStr, types.ColorReset)
+	// Update window title using ANSI escape sequence: \033]0;TITLE\007
+	// This shows status in the terminal tab/window title instead of a sticky header
+	title := fmt.Sprintf("MCode | %s | %s tokens", a.Config.Models[a.Config.CurrentModel].Name, usageStr)
+	fmt.Printf("\033]0;%s\007", title)
 }
 
 // Chat handles conversation with the AI model

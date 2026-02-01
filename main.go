@@ -11,8 +11,6 @@ import (
 	"coding-agent/pkg/commands"
 	"coding-agent/pkg/project"
 	"coding-agent/pkg/types"
-	"os/signal"
-	"syscall"
 
 	"golang.org/x/term"
 
@@ -73,29 +71,7 @@ func main() {
 	}
 
 	// Clear terminal on startup for interactive mode
-	// Clear terminal on startup for interactive mode
 	fmt.Print("\033[2J\033[H")
-
-	// Setup sticky header
-	// 1. Set scrolling region to start at line 2 (preserve line 1)
-	fmt.Print("\033[2;r")
-	// 2. Move cursor to line 2
-	fmt.Print("\033[2;1H")
-
-	// Handle window resize (SIGWINCH) to reset scrolling region
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, syscall.SIGWINCH)
-	go func() {
-		for range c {
-			// Re-apply scrolling region on resize
-			fmt.Print("\033[2;r")
-			// Redraw status immediately
-			agent.UpdateStatusDisplay(ag)
-		}
-	}()
-
-	// Ensure we reset terminal on exit
-	defer fmt.Print("\033[r")
 
 	// Get current model info for display
 	currentModel, exists := ag.Config.Models[ag.Config.CurrentModel]
@@ -125,17 +101,19 @@ func main() {
 		// Update status display
 		agent.UpdateStatusDisplay(ag)
 
-		// Update prompt with token count
+		// Update prompt with model and token count
 		tokens := agent.GetContextTokens(ag)
+		modelName := ag.Config.CurrentModel
+		
+		prompt := fmt.Sprintf("[%s] > ", modelName)
 		if tokens > 0 {
 			if tokens >= 1000 {
-				rl.SetPrompt(fmt.Sprintf("[%dk tokens] > ", tokens/1000))
+				prompt = fmt.Sprintf("[%s | %.1fk] > ", modelName, float64(tokens)/1000.0)
 			} else {
-				rl.SetPrompt(fmt.Sprintf("[%d tokens] > ", tokens))
+				prompt = fmt.Sprintf("[%s | %d] > ", modelName, tokens)
 			}
-		} else {
-			rl.SetPrompt("> ")
 		}
+		rl.SetPrompt(prompt)
 
 		line, err := rl.Readline()
 		if err != nil { // io.EOF or interrupt
