@@ -17,10 +17,9 @@ import (
 	"coding-agent/pkg/project"
 	"coding-agent/pkg/tools"
 	"coding-agent/pkg/types"
-	"coding-agent/pkg/tui"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/sashabaranov/go-openai"
+	"golang.org/x/term"
 )
 
 // New creates a new agent instance
@@ -530,96 +529,133 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 		}
 		defer stream.Close()
 
-		// Create channel for TUI updates
-		updates := make(chan interface{})
+		// Smart Diff Rendering
+		renderer, _ := markdown.NewNoMarginTermRenderer()
+		var previousLines []string
+		
+		// Helper to safely get term height
+		getTermHeight := func() int {
+			_, height, err := term.GetSize(int(os.Stdout.Fd()))
+			if err != nil {
+				return 24 // Fallback
+			}
+			return height
+		}
 
-		// Initialize TUI model
-		model := tui.NewStreamModel(updates)
-		p := tea.NewProgram(model)
+		var fullContent strings.Builder
+		var toolCalls []openai.ToolCall
 
-		// Start streaming in background
-		go func() {
-			defer close(updates)
+		// Spinner state
+		spinnerChars := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+		spinnerIdx := 0
+		showingToolSpinner := false
 
-			var fullContent strings.Builder
-			var toolCalls []openai.ToolCall
-
-			for {
-				response, err := stream.Recv()
-				if err != nil {
-					if err == io.EOF {
-						break
-					}
-					updates <- tui.StreamDoneMsg{Err: err}
-					return
+		for {
+			response, err := stream.Recv()
+			if err != nil {
+				if err == io.EOF {
+					break
 				}
+				return fmt.Errorf("error receiving stream: %v", err)
+			}
 
-				if len(response.Choices) > 0 {
-					delta := response.Choices[0].Delta
-					if delta.Content != "" {
-						fullContent.WriteString(delta.Content)
-						updates <- tui.StreamContentMsg(delta.Content)
+			if len(response.Choices) > 0 {
+				delta := response.Choices[0].Delta
+				
+				if delta.Content != "" {
+					fullContent.WriteString(delta.Content)
+
+					// 1. Render full content
+					rendered, err := renderer.Render(fullContent.String())
+					if err != nil {
+						// Fallback if render fails
+						fmt.Print(delta.Content)
+						continue
 					}
-					if len(delta.ToolCalls) > 0 {
-						for _, toolCall := range delta.ToolCalls {
-							idx := 0
-							if toolCall.Index != nil {
-								idx = *toolCall.Index
-							}
-							for len(toolCalls) <= idx {
-								toolCalls = append(toolCalls, openai.ToolCall{Function: openai.FunctionCall{}})
-							}
-							if toolCall.ID != "" {
-								toolCalls[idx].ID = toolCall.ID
-							}
-							if toolCall.Type != "" {
-								toolCalls[idx].Type = toolCall.Type
-							}
-							if toolCall.Function.Name != "" {
-								toolCalls[idx].Function.Name = toolCall.Function.Name
-							}
-							if toolCall.Function.Arguments != "" {
-								toolCalls[idx].Function.Arguments += toolCall.Function.Arguments
-							}
+
+					// 2. Split into lines
+					currentLines := strings.Split(strings.TrimRight(rendered, "\n"), "\n")
+					
+					// 3. Find first difference
+					diffIdx := 0
+					for diffIdx < len(previousLines) && diffIdx < len(currentLines) {
+						if previousLines[diffIdx] != currentLines[diffIdx] {
+							break
 						}
-						updates <- tui.StreamToolMsg{ToolCalls: toolCalls}
+						diffIdx++
 					}
+
+					// 4. Calculate backtrack
+					linesToBacktrack := len(previousLines) - diffIdx
+					
+					// 5. Clamp backtrack to visible screen height to avoid scrollback corruption
+					termHeight := getTermHeight()
+					if linesToBacktrack >= termHeight {
+						// If diff is off-screen, we can't update it. 
+						// Just append the new lines that fit or reset?
+						// Better strategy: "Give up" on the deep history update and just print from where we are?
+						// No, that duplicates.
+						// We must limit linesToBacktrack.
+						linesToBacktrack = termHeight - 1
+						diffIdx = len(previousLines) - linesToBacktrack
+						if diffIdx < 0 {
+							diffIdx = 0 // Should not happen with clamp logic above but safe guard
+						}
+					}
+
+					// 6. Move cursor and clear
+					if linesToBacktrack > 0 {
+						fmt.Printf("\033[%dA", linesToBacktrack)
+					}
+					fmt.Print("\r\033[J")
+
+					// 7. Print new/changed lines
+					for i := diffIdx; i < len(currentLines); i++ {
+						fmt.Println(currentLines[i])
+					}
+
+					previousLines = currentLines
+				}
+
+				// Tool calls
+				if len(delta.ToolCalls) > 0 {
+					for _, toolCall := range delta.ToolCalls {
+						idx := 0
+						if toolCall.Index != nil {
+							idx = *toolCall.Index
+						}
+						for len(toolCalls) <= idx {
+							toolCalls = append(toolCalls, openai.ToolCall{Function: openai.FunctionCall{}})
+						}
+						if toolCall.ID != "" {
+							toolCalls[idx].ID = toolCall.ID
+						}
+						if toolCall.Type != "" {
+							toolCalls[idx].Type = toolCall.Type
+						}
+						if toolCall.Function.Name != "" {
+							toolCalls[idx].Function.Name = toolCall.Function.Name
+						}
+						if toolCall.Function.Arguments != "" {
+							toolCalls[idx].Function.Arguments += toolCall.Function.Arguments
+						}
+					}
+					showingToolSpinner = true
 				}
 			}
-
-			updates <- tui.StreamDoneMsg{
-				FullContent: fullContent.String(),
-				ToolCalls:   toolCalls,
+			
+			if showingToolSpinner {
+				fmt.Printf("\r%s Processing tool calls...", spinnerChars[spinnerIdx%len(spinnerChars)])
+				spinnerIdx++
 			}
-		}()
-
-		// Run TUI
-		finalModel, err := p.Run()
-		if err != nil {
-			return fmt.Errorf("error running TUI: %v", err)
 		}
 
-		m, ok := finalModel.(*tui.StreamModel)
-		if !ok {
-			return fmt.Errorf("internal error: unexpected model type")
-		}
-		if err := m.Err(); err != nil {
-			return fmt.Errorf("streaming error: %v", err)
-		}
-
-		// Print the final result to the main buffer so it stays in history and is fully scrollable
-		if m.Content() != "" {
-			rendered, err := markdown.Render(m.Content())
-			if err == nil {
-				fmt.Print(rendered)
-			} else {
-				fmt.Print(m.Content())
-			}
-			fmt.Println() // Ensure newline after the message
+		if showingToolSpinner {
+			fmt.Print("\r\033[K") // Clear spinner
 		}
 
 		// Rough estimation: ~4 characters per token for response
-		responseTokens := len(m.Content()) / 4
+		responseTokens := len(fullContent.String()) / 4
 		if responseTokens < 1 {
 			responseTokens = 1
 		}
@@ -638,10 +674,9 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 		a.TotalTokensUsed += responseTokens
 
 		// Create assistant message with accumulated content and tool calls
-		toolCalls := m.ToolCalls()
 		assistantMessage := openai.ChatCompletionMessage{
 			Role:      openai.ChatMessageRoleAssistant,
-			Content:   m.Content(),
+			Content:   fullContent.String(),
 			ToolCalls: toolCalls,
 		}
 
