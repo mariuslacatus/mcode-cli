@@ -163,9 +163,17 @@ func RequestFolderPermission(a *types.Agent, folderPath string) bool {
 
 	fmt.Print("\a") // ASCII bell
 
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Scan()
-	response := strings.ToLower(strings.TrimSpace(scanner.Text()))
+	response := ReadConfirmation()
+	if response == "\r" || response == "\n" {
+		response = ""
+	}
+	
+	// Echo the choice
+	if response == "" {
+		fmt.Println("y")
+	} else {
+		fmt.Println(response)
+	}
 
 	if response == "" || response == "y" || response == "yes" {
 		a.ApprovedFolders[absPath] = true
@@ -485,8 +493,11 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 		}
 
 		// Create streaming request
-		stream, err := a.Client.CreateChatCompletionStream(ctx, req)
+		// Start interrupt monitor for streaming phase
+		streamCtx, cancelStream := StartInterruptMonitor(ctx)
+		stream, err := a.Client.CreateChatCompletionStream(streamCtx, req)
 		if err != nil {
+			cancelStream() // Stop monitor on error
 			spinner.Stop()
 			errStr := err.Error()
 			if strings.Contains(errStr, "tool call") || strings.Contains(errStr, "Failed to parse") ||
@@ -531,7 +542,10 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 				fmt.Println("🔄 Retrying with simplified request...")
 				spinner.Start()
 
-				resp, err := a.Client.CreateChatCompletion(ctx, reqFallback)
+				// Monitor interrupt during fallback
+				retryCtx, cancelRetry := StartInterruptMonitor(ctx)
+				resp, err := a.Client.CreateChatCompletion(retryCtx, reqFallback)
+				cancelRetry()
 				spinner.Stop()
 
 				if err != nil {
@@ -550,11 +564,12 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 				a.Conversation = append(a.Conversation, assistantMessage)
 
 				if choice.Message.Content != "" {
-					fmt.Print(choice.Message.Content)
+					PrintSafe(choice.Message.Content)
 				}
 
 				if len(choice.Message.ToolCalls) > 0 {
-					if err := handleToolCalls(a, choice.Message.ToolCalls, toolManager); err != nil {
+					tokenStats := fmt.Sprintf("(%d ctx | %d gen)", a.LastTokenUsage.PromptTokens, a.LastTokenUsage.CompletionTokens)
+					if err := handleToolCalls(a, choice.Message.ToolCalls, toolManager, tokenStats); err != nil {
 						return err
 					}
 				} else {
@@ -566,7 +581,7 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 			}
 		}
 		defer stream.Close()
-
+		
 		var previousLines []string
 		getTermHeight := func() int {
 			_, height, err := term.GetSize(int(os.Stdout.Fd()))
@@ -578,28 +593,63 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 
 		var fullContent strings.Builder
 		var toolCalls []openai.ToolCall
+		var toolArgsLen int
+		
+		genStartTime := time.Now()
+		contextTokens := GetContextTokens(a)
+
+		updateStats := func() {
+			genLen := fullContent.Len() + toolArgsLen
+			genTokens := genLen / 4
+			duration := time.Since(genStartTime).Seconds()
+			speed := 0.0
+			if duration > 0 {
+				speed = float64(genTokens) / duration
+			}
+
+			// Update window title
+			modelName := a.Config.Models[a.Config.CurrentModel].Name
+			title := fmt.Sprintf("MCode | %s | %d ctx | %d gen (%.1f t/s)", modelName, contextTokens, genTokens, speed)
+			fmt.Printf("\033]0;%s\007", title)
+
+			// Update spinner if active
+			spinner.UpdateMessage(fmt.Sprintf("%d tokens (%.1f t/s)", genTokens, speed))
+		}
+
+		var finishReason string
 
 		for {
 			response, err := stream.Recv()
 			if err != nil {
 				// We still stop on error or EOF
 				spinner.Stop()
+				cancelStream() // Stop monitor on error or EOF
 				if err == io.EOF {
 					break
+				}
+				// Check for interruption
+				if err == context.Canceled || streamCtx.Err() == context.Canceled {
+					fmt.Println("\n❌ Generation interrupted by user")
+					return nil
 				}
 				return fmt.Errorf("error receiving stream: %v", err)
 			}
 
 			if len(response.Choices) > 0 {
-				delta := response.Choices[0].Delta
+				choice := response.Choices[0]
+				if choice.FinishReason != "" {
+					finishReason = string(choice.FinishReason)
+				}
+				delta := choice.Delta
 				
 				if delta.Content != "" {
 					fullContent.WriteString(delta.Content)
+					updateStats()
 
 					rendered, err := renderer.Render(fullContent.String())
 					if err != nil {
 						spinner.Stop()
-						fmt.Print(delta.Content)
+						PrintSafe(delta.Content)
 						continue
 					}
 
@@ -639,13 +689,13 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 
 						// 6. Move cursor and clear
 						if linesToBacktrack > 0 {
-							fmt.Printf("\033[%dA", linesToBacktrack)
+							PrintfSafe("\033[%dA", linesToBacktrack)
 						}
-						fmt.Print("\r\033[J")
+						PrintSafe("\r\033[J")
 
 						// 7. Print new/changed lines
 						for i := diffIdx; i < len(currentLines); i++ {
-							fmt.Println(currentLines[i])
+							PrintlnSafe(currentLines[i])
 						}
 
 						previousLines = currentLines
@@ -676,6 +726,8 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 						}
 						if toolCall.Function.Arguments != "" {
 							toolCalls[idx].Function.Arguments += toolCall.Function.Arguments
+							toolArgsLen += len(toolCall.Function.Arguments)
+							updateStats()
 						}
 					}
 				}
@@ -683,7 +735,7 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 		}
 
 		// Rough estimation: ~4 characters per token for response
-		responseTokens := len(fullContent.String()) / 4
+		responseTokens := (fullContent.Len() + toolArgsLen) / 4
 		if responseTokens < 1 {
 			responseTokens = 1
 		}
@@ -714,9 +766,17 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 		// or before we break the loop
 		spinner.Stop()
 
+		if finishReason == "length" {
+			fmt.Printf("\n⚠️  Warning: Generation truncated due to length limit!\n")
+		}
+
 		// Check if the response contains tool calls
 		if len(toolCalls) > 0 {
-			if err := handleToolCalls(a, toolCalls, toolManager); err != nil {
+			tokenStats := ""
+			if a.LastTokenUsage != nil {
+				tokenStats = fmt.Sprintf("(%d ctx | %d gen)", a.LastTokenUsage.PromptTokens, a.LastTokenUsage.CompletionTokens)
+			}
+			if err := handleToolCalls(a, toolCalls, toolManager, tokenStats); err != nil {
 				return err
 			}
 		} else {
@@ -745,16 +805,23 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 }
 
 // handleToolCalls processes tool calls from the AI model
-func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *tools.Manager) error {
+func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *tools.Manager, tokenStats string) error {
 	for _, toolCall := range toolCalls {
 		// Start a spinner while we process this tool call (parse, check permissions, get preview)
-		spinner := NewSpinner("")
+		msg := fmt.Sprintf("Processing %s", toolCall.Function.Name)
+		if tokenStats != "" {
+			msg += " " + tokenStats
+		}
+		spinner := NewSpinner(msg)
 		spinner.Start()
 
 		var params map[string]interface{}
 		if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &params); err != nil {
 			spinner.Stop()
 			fmt.Printf("Error parsing tool parameters: %v\n", err)
+			if len(toolCall.Function.Arguments) > 0 {
+				fmt.Printf("Partial JSON (len=%d): %s...\n", len(toolCall.Function.Arguments), toolCall.Function.Arguments)
+			}
 			continue
 		}
 
@@ -884,10 +951,19 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 				prompt = "\n❓ Execute this tool? (Y/n/s to skip/i to interrupt/b for background): "
 			}
 			playNotificationSound()
-			fmt.Print(prompt)
-			inputScanner := bufio.NewScanner(os.Stdin)
-			inputScanner.Scan()
-			response = strings.ToLower(strings.TrimSpace(inputScanner.Text()))
+			PrintSafe(prompt)
+			
+			response = ReadConfirmation()
+			if response == "\r" || response == "\n" {
+				response = "" // Treat Enter as default (yes)
+			}
+			
+			// Echo the choice since raw mode doesn't
+			if response == "" {
+				PrintlnSafe("y")
+			} else {
+				PrintlnSafe(response)
+			}
 		}
 
 		// executeToolBasedOnResponse already has its own spinner
@@ -1062,9 +1138,9 @@ func (s *Spinner) Start() {
 
 		// Print first frame immediately
 		if s.message != "" {
-			fmt.Printf("\r\033[K%s %s", spinnerChars[0], s.message)
+			PrintfSafe("\r\033[K%s %s", spinnerChars[0], s.message)
 		} else {
-			fmt.Printf("\r\033[K%s", spinnerChars[0])
+			PrintfSafe("\r\033[K%s", spinnerChars[0])
 		}
 		os.Stdout.Sync()
 		i++
@@ -1073,7 +1149,7 @@ func (s *Spinner) Start() {
 			select {
 			case <-s.done:
 				// Clear the spinner completely
-				fmt.Print("\r\033[K")
+				PrintSafe("\r\033[K")
 				os.Stdout.Sync()
 				if s.cleared != nil {
 					s.cleared <- true
@@ -1081,9 +1157,9 @@ func (s *Spinner) Start() {
 				return
 			case <-ticker.C:
 				if s.message != "" {
-					fmt.Printf("\r\033[K%s %s", spinnerChars[i%len(spinnerChars)], s.message)
+					PrintfSafe("\r\033[K%s %s", spinnerChars[i%len(spinnerChars)], s.message)
 				} else {
-					fmt.Printf("\r\033[K%s", spinnerChars[i%len(spinnerChars)])
+					PrintfSafe("\r\033[K%s", spinnerChars[i%len(spinnerChars)])
 				}
 				os.Stdout.Sync()
 				i++
@@ -1124,11 +1200,11 @@ func streamOutput(content string) {
 		}
 
 		chunk := content[i:end]
-		fmt.Print(chunk)
+		PrintSafe(chunk)
 		os.Stdout.Sync() // Force immediate flush after each chunk
 
 		// Very small delay
 		time.Sleep(1 * time.Millisecond)
 	}
-	fmt.Println() // Ensure newline at end
+	PrintlnSafe() // Ensure newline at end
 }
