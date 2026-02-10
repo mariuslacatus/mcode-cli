@@ -37,6 +37,9 @@ func NewTermRenderer() (*Renderer, error) {
 	if err != nil {
 		width = 80 // Default fallback
 	}
+	if width > 2 {
+		width -= 2
+	}
 
 	tr, err := glamour.NewTermRenderer(
 		glamour.WithAutoStyle(),
@@ -55,6 +58,9 @@ func NewNoMarginTermRenderer() (*Renderer, error) {
 	width, _, err := term.GetSize(int(os.Stdout.Fd()))
 	if err != nil {
 		width = 80 // Default fallback
+	}
+	if width > 2 {
+		width -= 2
 	}
 
 	// Use DarkStyleConfig as base but remove margins

@@ -541,6 +541,7 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 		// For real-time rendering
 		renderer, _ := markdown.NewNoMarginTermRenderer()
 		lastRenderedLines := 0
+		tokenCount := 0
 
 		for {
 			response, err := stream.Recv()
@@ -557,21 +558,25 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 				// Stream content as it arrives
 				if delta.Content != "" {
 					fullContent.WriteString(delta.Content)
+					tokenCount++
 
-					// Clear previous rendered output
-					if lastRenderedLines > 0 {
-						fmt.Printf("\033[%dA", lastRenderedLines)
-					}
-					fmt.Print("\r\033[J")
+					// Only re-render on newlines, first token, or every 10 tokens to save scrollback
+					if tokenCount == 1 || strings.Contains(delta.Content, "\n") || tokenCount%10 == 0 {
+						// Clear previous rendered output
+						if lastRenderedLines > 0 {
+							fmt.Printf("\033[%dA", lastRenderedLines)
+						}
+						fmt.Print("\r\033[J")
 
-					// Render full content
-					rendered, err := renderer.Render(fullContent.String())
-					if err == nil {
-						fmt.Print(rendered)
-						lastRenderedLines = strings.Count(rendered, "\n")
-					} else {
-						fmt.Print(fullContent.String())
-						lastRenderedLines = strings.Count(fullContent.String(), "\n")
+						// Render full content
+						rendered, err := renderer.Render(fullContent.String())
+						if err == nil {
+							fmt.Print(rendered)
+							lastRenderedLines = strings.Count(rendered, "\n")
+						} else {
+							fmt.Print(fullContent.String())
+							lastRenderedLines = strings.Count(fullContent.String(), "\n")
+						}
 					}
 				}
 
@@ -623,6 +628,20 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 
 			// Note: Usage information is typically only available in the final chunk
 			// for streaming responses, but some implementations may provide it elsewhere
+		}
+
+		// Final re-render to ensure full content is shown
+		if fullContent.Len() > 0 {
+			if lastRenderedLines > 0 {
+				fmt.Printf("\033[%dA", lastRenderedLines)
+			}
+			fmt.Print("\r\033[J")
+			rendered, err := renderer.Render(fullContent.String())
+			if err == nil {
+				fmt.Print(rendered)
+			} else {
+				fmt.Print(fullContent.String())
+			}
 		}
 
 		// Stop spinner if it's still running
