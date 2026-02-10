@@ -492,10 +492,6 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 			Stream:    true,
 		}
 
-		// Debug: Log request to a file
-		reqJSON, _ := json.MarshalIndent(req, "", "  ")
-		os.WriteFile("/tmp/mcode_last_request.json", reqJSON, 0644)
-
 		// Create streaming request
 		// Start interrupt monitor for streaming phase
 		streamCtx, cancelStream := StartInterruptMonitor(ctx)
@@ -506,13 +502,9 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 			errStr := err.Error()
 			if strings.Contains(errStr, "tool call") || strings.Contains(errStr, "Failed to parse") ||
 				strings.Contains(errStr, "Unexpected end") || strings.Contains(errStr, "context") ||
-				strings.Contains(errStr, "too long") || strings.Contains(errStr, "maximum") ||
-				strings.Contains(errStr, "unmarshal") {
+				strings.Contains(errStr, "too long") || strings.Contains(errStr, "maximum") {
 
 				fmt.Printf("\n⚠️  Request failed: %v\n", err)
-				if strings.Contains(errStr, "unmarshal") {
-					fmt.Println("💡 This unmarshal error often happens with Gemini API when a request is rejected (e.g. by safety filters). Retrying without streaming...")
-				}
 
 				if strings.Contains(errStr, "context") || strings.Contains(errStr, "too long") ||
 					strings.Contains(errStr, "maximum") || a.LastTokenUsage != nil && a.LastTokenUsage.PromptTokens > 6000 {
@@ -547,10 +539,6 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 					MaxTokens: 2000,
 				}
 
-				// Debug: Log fallback request
-				reqJSON, _ := json.MarshalIndent(reqFallback, "", "  ")
-				os.WriteFile("/tmp/mcode_last_request_fallback.json", reqJSON, 0644)
-
 				fmt.Println("🔄 Retrying with simplified request...")
 				spinner.Start()
 
@@ -579,41 +567,19 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 					PrintSafe(choice.Message.Content)
 				}
 
-									if len(choice.Message.ToolCalls) > 0 {
-
-										tokenStats := fmt.Sprintf("(%d ctx | %d gen)", a.LastTokenUsage.PromptTokens, a.LastTokenUsage.CompletionTokens)
-
-										if err := handleToolCalls(a, choice.Message.ToolCalls, toolManager, tokenStats); err != nil {
-
-											return err
-
-										}
-
-									} else {
-
-										break
-
-									}
-
-									continue
-
-								} else {
-
-									errStr := err.Error()
-
-									if strings.Contains(errStr, "cannot unmarshal array into Go value of type openai.ErrorResponse") {
-
-										return fmt.Errorf("API error: The server returned an error in a format the client couldn't parse. \n💡 This often happens with Gemini API when content is blocked by safety filters or when using an incompatible endpoint.\nOriginal error: %v", err)
-
-									}
-
-									return fmt.Errorf("error calling API: %v", err)
-
-								}
-
-							}
-
-				
+				if len(choice.Message.ToolCalls) > 0 {
+					tokenStats := fmt.Sprintf("(%d ctx | %d gen)", a.LastTokenUsage.PromptTokens, a.LastTokenUsage.CompletionTokens)
+					if err := handleToolCalls(a, choice.Message.ToolCalls, toolManager, tokenStats); err != nil {
+						return err
+					}
+				} else {
+					break
+				}
+				continue
+			} else {
+				return fmt.Errorf("error calling API: %v", err)
+			}
+		}
 		defer stream.Close()
 		
 		var previousLines []string
@@ -665,10 +631,6 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 				if err == context.Canceled || streamCtx.Err() == context.Canceled {
 					fmt.Println("\n❌ Generation interrupted by user")
 					return nil
-				}
-				errStr := err.Error()
-				if strings.Contains(errStr, "cannot unmarshal array into Go value of type openai.ErrorResponse") {
-					return fmt.Errorf("API error: The server returned an error in a format the client couldn't parse. \n💡 This often happens with Gemini API when content is blocked by safety filters or when using an incompatible endpoint.\nOriginal error: %v", err)
 				}
 				return fmt.Errorf("error receiving stream: %v", err)
 			}
@@ -751,10 +713,7 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 							idx = *toolCall.Index
 						}
 						for len(toolCalls) <= idx {
-							toolCalls = append(toolCalls, openai.ToolCall{
-								Type:     openai.ToolTypeFunction,
-								Function: openai.FunctionCall{},
-							})
+							toolCalls = append(toolCalls, openai.ToolCall{Function: openai.FunctionCall{}})
 						}
 						if toolCall.ID != "" {
 							toolCalls[idx].ID = toolCall.ID
@@ -794,33 +753,12 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 		}
 		a.TotalTokensUsed += responseTokens
 
-				// Create assistant message with accumulated content and tool calls
-
-				content := fullContent.String()
-
-				// If content is empty but we have tool calls, use a single space.
-
-				// Some Gemini adapters require non-empty content OR fail with empty string but work with space.
-
-				if content == "" && len(toolCalls) > 0 {
-
-					content = " " 
-
-				}
-
-		
-
-				assistantMessage := openai.ChatCompletionMessage{
-
-					Role:      openai.ChatMessageRoleAssistant,
-
-					Content:   content,
-
-					ToolCalls: toolCalls,
-
-				}
-
-		
+		// Create assistant message with accumulated content and tool calls
+		assistantMessage := openai.ChatCompletionMessage{
+			Role:      openai.ChatMessageRoleAssistant,
+			Content:   fullContent.String(),
+			ToolCalls: toolCalls,
+		}
 
 		a.Conversation = append(a.Conversation, assistantMessage)
 
@@ -1061,14 +999,10 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 		}
 
 		// Add tool result to conversation
-		if toolCall.ID == "" {
-			fmt.Printf("⚠️  Warning: Tool call missing ID. This may cause errors with some APIs (like Gemini).\n")
-		}
 		a.Conversation = append(a.Conversation, openai.ChatCompletionMessage{
 			Role:       openai.ChatMessageRoleTool,
 			Content:    result,
 			ToolCallID: toolCall.ID,
-			Name:       toolCall.Function.Name,
 		})
 
 		if !shouldContinue {
