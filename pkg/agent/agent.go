@@ -8,7 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"io"
 
@@ -287,8 +290,12 @@ func CompactContext(a *types.Agent) error {
 	}
 
 	// Execute request with streaming
+	spinner := NewSpinner("Compacting context...")
+	spinner.Start()
+
 	stream, err := a.Client.CreateChatCompletionStream(context.Background(), req)
 	if err != nil {
+		spinner.Stop()
 		return fmt.Errorf("failed to start summary stream: %v", err)
 	}
 	defer stream.Close()
@@ -299,6 +306,7 @@ func CompactContext(a *types.Agent) error {
 	for {
 		response, err := stream.Recv()
 		if err != nil {
+			spinner.Stop()
 			if err.Error() == "EOF" {
 				break
 			}
@@ -308,6 +316,7 @@ func CompactContext(a *types.Agent) error {
 		if len(response.Choices) > 0 {
 			content := response.Choices[0].Delta.Content
 			if content != "" {
+				spinner.Stop()
 				fmt.Print(content)
 				summaryBuilder.WriteString(content)
 			}
@@ -410,6 +419,8 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 		return nil
 	}
 
+	renderer, _ := markdown.NewNoMarginTermRenderer()
+
 	for {
 		// Update status display before generating
 		UpdateStatusDisplay(a)
@@ -423,49 +434,60 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 		// Check if context is getting too large and trim if needed
 		messages := a.Conversation
 
-		// Auto-compaction check (approx 30k tokens)
-		// We use the last known token usage plus estimation
+		// Auto-compaction check
 		currentTokens := 0
 		if a.LastTokenUsage != nil {
 			currentTokens = a.LastTokenUsage.TotalTokens
 		}
 
-		// If we're over the limit, compact automatically
-		if currentTokens > 30000 {
-			spinnerDone := make(chan bool)
-			spinnerCleared := make(chan bool)
-			fmt.Printf("\n⚠️  Context limit reached (%d tokens). Auto-compacting...\n", currentTokens)
-			go startSpinner(spinnerDone, spinnerCleared)
+		threshold := 30000
+		if currentModel.MaxTokens > 0 {
+			threshold = int(float64(currentModel.MaxTokens) * 0.8)
+		}
 
+		// Start the "thinking" spinner early - it will stay until content arrives or turn ends
+		spinner := NewSpinner("")
+		spinner.Start()
+
+		if currentTokens > threshold {
+			// Temporarily stop thinking spinner to show compaction progress
+			spinner.Stop()
+			fmt.Printf("\n⚠️  Context threshold reached (%d/%d tokens). Auto-compacting...\n", currentTokens, currentModel.MaxTokens)
 			err := CompactContext(a)
-
-			// Stop spinner
-			spinnerDone <- true
-			<-spinnerCleared
 
 			if err != nil {
 				fmt.Printf("Warning: Auto-compaction failed: %v\n", err)
 			} else {
-				// Update messages reference after compaction
 				messages = a.Conversation
 			}
+			// Restart thinking spinner
+			spinner.Start()
 		}
 
-		// Use a reasonable default max tokens without context window restrictions
-		maxTokens := 40000
+		// Use a reasonable max tokens for completion
+		maxTokens := 4000
+		if currentModel.MaxTokens > 0 {
+			remainingTokens := currentModel.MaxTokens - currentTokens
+			if remainingTokens < maxTokens {
+				maxTokens = remainingTokens
+			}
+			if maxTokens < 500 {
+				maxTokens = 500
+			}
+		}
 
 		req := openai.ChatCompletionRequest{
 			Model:     currentModel.Name,
 			Messages:  messages,
 			Tools:     toolManager.GetToolDefinitions(),
 			MaxTokens: maxTokens,
-			Stream:    true, // Enable streaming
+			Stream:    true,
 		}
 
 		// Create streaming request
 		stream, err := a.Client.CreateChatCompletionStream(ctx, req)
 		if err != nil {
-			// Check for context overflow or tool calling errors
+			spinner.Stop()
 			errStr := err.Error()
 			if strings.Contains(errStr, "tool call") || strings.Contains(errStr, "Failed to parse") ||
 				strings.Contains(errStr, "Unexpected end") || strings.Contains(errStr, "context") ||
@@ -475,29 +497,47 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 
 				if strings.Contains(errStr, "context") || strings.Contains(errStr, "too long") ||
 					strings.Contains(errStr, "maximum") || a.LastTokenUsage != nil && a.LastTokenUsage.PromptTokens > 6000 {
-					fmt.Println("💡 This looks like a context window overflow. Trimming context and retrying...")
-					messages = TrimContext(a, a.Conversation)
-					// Update the conversation permanently to the trimmed version
-					a.Conversation = messages
-				} else {
-					fmt.Printf("💡 This may be a tool calling format issue with model '%s'.\n", currentModel.Name)
-					fmt.Println("   Try switching to a more compatible model with: /models")
+					
+					re := regexp.MustCompile(`context length is (\d+)`)
+					matches := re.FindStringSubmatch(errStr)
+					if len(matches) > 1 {
+						if limit, err := strconv.Atoi(matches[1]); err == nil {
+							fmt.Printf("💡 Detected model context limit: %d tokens\n", limit)
+							currentModel.MaxTokens = limit
+							if model, ok := a.Config.Models[a.Config.CurrentModel]; ok {
+								model.MaxTokens = limit
+								a.Config.Models[a.Config.CurrentModel] = model
+								config.Save(a.ConfigPath, a.Config)
+							}
+						}
+					}
+
+					fmt.Println("💡 Context window overflow. Auto-compacting and retrying...")
+					if err := CompactContext(a); err != nil {
+						fmt.Println("⚠️  Compaction failed, falling back to simple trimming...")
+						messages = TrimContext(a, a.Conversation)
+						a.Conversation = messages
+					} else {
+						messages = a.Conversation
+					}
 				}
 
-				// Try with trimmed context and no tools as fallback (non-streaming)
 				reqFallback := openai.ChatCompletionRequest{
 					Model:     currentModel.Name,
 					Messages:  messages,
-					MaxTokens: 2000, // Reduce max tokens to leave more room
+					MaxTokens: 2000,
 				}
 
 				fmt.Println("🔄 Retrying with simplified request...")
+				spinner.Start()
+
 				resp, err := a.Client.CreateChatCompletion(ctx, reqFallback)
+				spinner.Stop()
+
 				if err != nil {
 					return fmt.Errorf("error calling API (even after fallback): %v", err)
 				}
 
-				// Handle non-streaming fallback response
 				a.LastTokenUsage = &resp.Usage
 				a.TotalTokensUsed += resp.Usage.TotalTokens
 
@@ -507,14 +547,12 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 					Content:   choice.Message.Content,
 					ToolCalls: choice.Message.ToolCalls,
 				}
-
 				a.Conversation = append(a.Conversation, assistantMessage)
 
 				if choice.Message.Content != "" {
 					fmt.Print(choice.Message.Content)
 				}
 
-				// Check for tool calls in fallback response
 				if len(choice.Message.ToolCalls) > 0 {
 					if err := handleToolCalls(a, choice.Message.ToolCalls, toolManager); err != nil {
 						return err
@@ -529,15 +567,11 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 		}
 		defer stream.Close()
 
-		// Smart Diff Rendering
-		renderer, _ := markdown.NewNoMarginTermRenderer()
 		var previousLines []string
-		
-		// Helper to safely get term height
 		getTermHeight := func() int {
 			_, height, err := term.GetSize(int(os.Stdout.Fd()))
 			if err != nil {
-				return 24 // Fallback
+				return 24
 			}
 			return height
 		}
@@ -545,14 +579,11 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 		var fullContent strings.Builder
 		var toolCalls []openai.ToolCall
 
-		// Spinner state
-		spinnerChars := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-		spinnerIdx := 0
-		showingToolSpinner := false
-
 		for {
 			response, err := stream.Recv()
 			if err != nil {
+				// We still stop on error or EOF
+				spinner.Stop()
 				if err == io.EOF {
 					break
 				}
@@ -565,10 +596,9 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 				if delta.Content != "" {
 					fullContent.WriteString(delta.Content)
 
-					// 1. Render full content
 					rendered, err := renderer.Render(fullContent.String())
 					if err != nil {
-						// Fallback if render fails
+						spinner.Stop()
 						fmt.Print(delta.Content)
 						continue
 					}
@@ -603,22 +633,30 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 						}
 					}
 
-					// 6. Move cursor and clear
-					if linesToBacktrack > 0 {
-						fmt.Printf("\033[%dA", linesToBacktrack)
-					}
-					fmt.Print("\r\033[J")
+					// Only update screen and stop spinner if there are changes
+					if linesToBacktrack > 0 || diffIdx < len(currentLines) {
+						spinner.Stop()
 
-					// 7. Print new/changed lines
-					for i := diffIdx; i < len(currentLines); i++ {
-						fmt.Println(currentLines[i])
-					}
+						// 6. Move cursor and clear
+						if linesToBacktrack > 0 {
+							fmt.Printf("\033[%dA", linesToBacktrack)
+						}
+						fmt.Print("\r\033[J")
 
-					previousLines = currentLines
+						// 7. Print new/changed lines
+						for i := diffIdx; i < len(currentLines); i++ {
+							fmt.Println(currentLines[i])
+						}
+
+						previousLines = currentLines
+					}
 				}
 
 				// Tool calls
 				if len(delta.ToolCalls) > 0 {
+					// Ensure spinner is running for tool call streaming
+					spinner.Start()
+
 					for _, toolCall := range delta.ToolCalls {
 						idx := 0
 						if toolCall.Index != nil {
@@ -640,18 +678,8 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 							toolCalls[idx].Function.Arguments += toolCall.Function.Arguments
 						}
 					}
-					showingToolSpinner = true
 				}
 			}
-			
-			if showingToolSpinner {
-				fmt.Printf("\r%s Processing tool calls...", spinnerChars[spinnerIdx%len(spinnerChars)])
-				spinnerIdx++
-			}
-		}
-
-		if showingToolSpinner {
-			fmt.Print("\r\033[K") // Clear spinner
 		}
 
 		// Rough estimation: ~4 characters per token for response
@@ -681,6 +709,10 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 		}
 
 		a.Conversation = append(a.Conversation, assistantMessage)
+
+		// Ensure spinner is stopped before we might enter tool call handling
+		// or before we break the loop
+		spinner.Stop()
 
 		// Check if the response contains tool calls
 		if len(toolCalls) > 0 {
@@ -715,16 +747,19 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 // handleToolCalls processes tool calls from the AI model
 func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *tools.Manager) error {
 	for _, toolCall := range toolCalls {
+		// Start a spinner while we process this tool call (parse, check permissions, get preview)
+		spinner := NewSpinner("")
+		spinner.Start()
+
 		var params map[string]interface{}
 		if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &params); err != nil {
+			spinner.Stop()
 			fmt.Printf("Error parsing tool parameters: %v\n", err)
 			continue
 		}
 
-		// Display condensed tool call format with useful parameters
+		// Prepare tool display header
 		toolDisplay := fmt.Sprintf("🔧 %s%s%s", types.ColorCyan, toolCall.Function.Name, types.ColorReset)
-
-		// Add relevant parameters for different tools
 		switch toolCall.Function.Name {
 		case "read_file", "preview_edit", "write_file":
 			if path, exists := params["path"]; exists {
@@ -737,29 +772,21 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 				}
 			}
 		case "edit_file":
-			// Handle both old and new parameter names
 			var path string
 			if filePath, exists := params["filePath"]; exists {
 				path = fmt.Sprintf("%v", filePath)
 			} else if oldPath, exists := params["path"]; exists {
 				path = fmt.Sprintf("%v", oldPath)
 			}
-
-			// Use relative path for display
 			relPath, err := filepath.Rel(".", path)
 			if err == nil {
 				path = relPath
 			}
-
-			// Show the mode being used
 			if oldString, hasOld := params["oldString"]; hasOld && oldString != "" {
-				// Incremental mode - FAST!
 				toolDisplay += fmt.Sprintf(" 🚀 %s [INCREMENTAL]", path)
 			} else if _, hasNewString := params["newString"]; hasNewString {
-				// New file mode - FAST!
 				toolDisplay += fmt.Sprintf(" 🚀 %s [NEW FILE]", path)
 			} else {
-				// Full replacement mode - SLOW!
 				toolDisplay += fmt.Sprintf(" 📄 %s [FULL REPLACEMENT]", path)
 			}
 		case "list_files":
@@ -783,9 +810,7 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 			}
 		}
 
-		fmt.Printf("\n%s\n", toolDisplay)
-
-		// Check if this looks like a long-running command
+		// Check for long-running and permissions
 		isLongRunning := false
 		if toolCall.Function.Name == "bash_command" {
 			if cmdParam, exists := params["command"]; exists {
@@ -795,72 +820,89 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 			}
 		}
 
-		// Check if this is a folder operation that needs permission
 		shouldAutoExecute := false
+		var permissionError string
 		if toolCall.Function.Name == "list_files" || toolCall.Function.Name == "read_file" || toolCall.Function.Name == "preview_edit" {
 			var folderPath string
 			if pathParam, exists := params["path"]; exists {
 				if pathStr, ok := pathParam.(string); ok {
 					if toolCall.Function.Name == "read_file" || toolCall.Function.Name == "preview_edit" {
-						// For read_file and preview_edit, get the directory of the file
 						folderPath = filepath.Dir(pathStr)
 					} else {
-						// For list_files, use the path directly
 						folderPath = pathStr
 					}
 
-					// Check if folder is already approved
 					if IsFolderApproved(a, folderPath) {
 						shouldAutoExecute = true
 					} else {
-						// Request permission for this folder
+						// We must stop spinner before requesting permission via UI
+						spinner.Stop()
 						if !RequestFolderPermission(a, folderPath) {
-							// Add permission denied result and continue to next tool
-							a.Conversation = append(a.Conversation, openai.ChatCompletionMessage{
-								Role:       openai.ChatMessageRoleTool,
-								Content:    "Permission denied for folder access",
-								ToolCallID: toolCall.ID,
-							})
-							continue
+							permissionError = "Permission denied for folder access"
+						} else {
+							shouldAutoExecute = true
+							// Restart spinner for subsequent processing (like GetPreview)
+							spinner.Start()
 						}
-						shouldAutoExecute = true
 					}
 				}
 			}
 		}
 
-		var response string
+		if permissionError != "" {
+			spinner.Stop()
+			a.Conversation = append(a.Conversation, openai.ChatCompletionMessage{
+				Role:       openai.ChatMessageRoleTool,
+				Content:    permissionError,
+				ToolCallID: toolCall.ID,
+			})
+			continue
+		}
 
+		// Get preview (potentially slow)
+		var preview string
+		if toolCall.Function.Name == "edit_file" || toolCall.Function.Name == "write_file" {
+			preview, _ = toolManager.GetPreview(toolCall.Function.Name, params)
+		}
+
+		// NOW we are ready to show everything and prompt the user
+		spinner.Stop()
+		fmt.Printf("\n%s\n", toolDisplay)
+
+		if preview != "" {
+			fmt.Printf("\n%s--- PREVIEW ---%s\n%s\n%s--- END PREVIEW ---%s\n",
+				types.ColorBlue, types.ColorReset, preview, types.ColorBlue, types.ColorReset)
+		}
+
+		var response string
 		if shouldAutoExecute {
-			// Auto-execute approved folder operations
 			response = "y"
 		} else {
-			// Ask for confirmation for other operations
 			prompt := "\n❓ Execute this tool? (Y/n/s to skip/i to interrupt): "
 			if isLongRunning {
 				fmt.Printf("%s⚠️  This looks like a long-running command!%s\n", types.ColorYellow, types.ColorReset)
 				prompt = "\n❓ Execute this tool? (Y/n/s to skip/i to interrupt/b for background): "
 			}
-
-			// Play notification sound
 			playNotificationSound()
-
 			fmt.Print(prompt)
-
 			inputScanner := bufio.NewScanner(os.Stdin)
 			inputScanner.Scan()
 			response = strings.ToLower(strings.TrimSpace(inputScanner.Text()))
 		}
 
-		// Execute tool based on response
+		// executeToolBasedOnResponse already has its own spinner
 		result, shouldContinue := executeToolBasedOnResponse(a, response, toolCall, params, isLongRunning, toolManager)
 
 		// Display tool output to user
 		if result != "" && (response == "" || response == "y" || response == "yes" || response == "b" || response == "background") {
 			fmt.Println() // Add blank line after tool call
-			if toolCall.Function.Name == "edit_file" {
-				// Stream diffs for nice effect
-				streamOutput(result)
+			if toolCall.Function.Name == "edit_file" || toolCall.Function.Name == "write_file" {
+				// Only stream diff/output if it wasn't already shown in preview
+				if preview == "" {
+					streamOutput(result)
+				} else {
+					fmt.Printf("✅ %s applied successfully\n\n", toolCall.Function.Name)
+				}
 			} else if toolCall.Function.Name != "read_file" && toolCall.Function.Name != "list_files" && toolCall.Function.Name != "bash_command" {
 				// Generic output display (skip read_file, list_files, and bash_command to avoid clutter/duplication)
 				fmt.Printf("%s> Tool Output:%s\n", types.ColorCyan, types.ColorReset)
@@ -921,8 +963,16 @@ func executeToolBasedOnResponse(a *types.Agent, response string, toolCall openai
 			fmt.Printf("Unknown tool: %s\n", toolCall.Function.Name)
 			result = "Error: Unknown tool"
 		} else {
+			// Start spinner for tool execution
+			spinner := NewSpinner(fmt.Sprintf("Executing %s...", toolCall.Function.Name))
+			spinner.Start()
+
 			var err error
 			result, err = toolFunc(params)
+
+			// Stop spinner
+			spinner.Stop()
+
 			if err != nil {
 				result = fmt.Sprintf("Error: %v", err)
 			}
@@ -975,29 +1025,92 @@ func executeToolBasedOnResponse(a *types.Agent, response string, toolCall openai
 	return result, true
 }
 
-// startSpinner shows an animated spinner until stopped
-func startSpinner(done chan bool, cleared chan bool) {
-	spinnerChars := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-	i := 0
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
+// Spinner represents a thread-safe terminal spinner
+type Spinner struct {
+	mu      sync.Mutex
+	done    chan bool
+	cleared chan bool
+	active  bool
+	message string
+}
 
-	for {
-		select {
-		case <-done:
-			// Clear the spinner completely
-			fmt.Print("\r\033[K") // Clear current line entirely
-			os.Stdout.Sync()
-			if cleared != nil {
-				cleared <- true // Signal that spinner is cleared
-			}
-			return
-		case <-ticker.C:
-			fmt.Printf("\r%s ", spinnerChars[i%len(spinnerChars)])
-			os.Stdout.Sync()
-			i++
-		}
+// NewSpinner creates a new spinner
+func NewSpinner(message string) *Spinner {
+	return &Spinner{
+		message: message,
 	}
+}
+
+// Start starts the spinner if it's not already running
+func (s *Spinner) Start() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.active {
+		return
+	}
+
+	s.done = make(chan bool)
+	s.cleared = make(chan bool)
+	s.active = true
+
+	go func() {
+		spinnerChars := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+		i := 0
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		// Print first frame immediately
+		if s.message != "" {
+			fmt.Printf("\r\033[K%s %s", spinnerChars[0], s.message)
+		} else {
+			fmt.Printf("\r\033[K%s", spinnerChars[0])
+		}
+		os.Stdout.Sync()
+		i++
+
+		for {
+			select {
+			case <-s.done:
+				// Clear the spinner completely
+				fmt.Print("\r\033[K")
+				os.Stdout.Sync()
+				if s.cleared != nil {
+					s.cleared <- true
+				}
+				return
+			case <-ticker.C:
+				if s.message != "" {
+					fmt.Printf("\r\033[K%s %s", spinnerChars[i%len(spinnerChars)], s.message)
+				} else {
+					fmt.Printf("\r\033[K%s", spinnerChars[i%len(spinnerChars)])
+				}
+				os.Stdout.Sync()
+				i++
+			}
+		}
+	}()
+}
+
+// Stop stops the spinner if it is running
+func (s *Spinner) Stop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.active {
+		return
+	}
+
+	s.done <- true
+	<-s.cleared
+	s.active = false
+}
+
+// UpdateMessage updates the spinner message
+func (s *Spinner) UpdateMessage(message string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.message = message
 }
 
 // streamOutput simulates streaming output for content

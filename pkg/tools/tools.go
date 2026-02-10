@@ -301,6 +301,68 @@ func (m *Manager) BashCommandBackground(params map[string]interface{}) string {
 	return fmt.Sprintf("Command started in background with PID %d. Use 'ps aux | grep \"%s\"' to check status.", cmd.Process.Pid, command)
 }
 
+// GetPreview returns a preview of the changes a tool would make
+func (m *Manager) GetPreview(name string, params map[string]interface{}) (string, error) {
+	switch name {
+	case "edit_file":
+		filePath, ok := params["filePath"].(string)
+		if !ok {
+			return "", nil
+		}
+
+		// Handle incremental edit (oldString + newString)
+		if oldStringParam, exists := params["oldString"]; exists {
+			oldString, _ := oldStringParam.(string)
+			newString, _ := params["newString"].(string)
+			replaceAll, _ := params["replaceAll"].(bool)
+
+			// Read existing content
+			content, err := os.ReadFile(filePath)
+			if err != nil {
+				return "", nil // Or maybe it's a new file?
+			}
+			oldContent := string(content)
+
+			// Perform incremental replacement
+			newContent, err := ReplaceInContent(oldContent, oldString, newString, replaceAll)
+			if err != nil {
+				return "", nil // Can't preview if replace fails
+			}
+
+			// Generate and return a focused diff
+			return GenerateFocusedDiff(oldContent, newContent, filePath, oldString, newString), nil
+		}
+
+		// For new file creation
+		if newStringParam, exists := params["newString"]; exists {
+			newString, _ := newStringParam.(string)
+			return fmt.Sprintf("📝 New file will be created: %s\n\n%s", filePath, truncatePreview(newString, 500)), nil
+		}
+
+	case "write_file":
+		path, ok := params["path"].(string)
+		if !ok {
+			return "", nil
+		}
+		content, ok := params["content"].(string)
+		if !ok {
+			return "", nil
+		}
+
+		var oldContent string
+		if existingContent, err := os.ReadFile(path); err == nil {
+			oldContent = string(existingContent)
+		}
+
+		if oldContent == "" {
+			return fmt.Sprintf("📝 New file will be created: %s\n\n%s", path, truncatePreview(content, 500)), nil
+		} else if oldContent != content {
+			return GenerateDiff(oldContent, content, path), nil
+		}
+	}
+	return "", nil
+}
+
 // EditFile creates or edits a file using OpenCode-compatible parameters.
 func (m *Manager) EditFile(params map[string]interface{}) (string, error) {
 	filePath, ok := params["filePath"].(string)
@@ -740,16 +802,7 @@ func ReplaceInContent(content, oldString, newString string, replaceAll bool) (st
 
 // GenerateFocusedDiff generates a diff focused around the changed area
 func GenerateFocusedDiff(oldContent, newContent, filename, oldString, newString string) string {
-	var result strings.Builder
-	result.WriteString(fmt.Sprintf("📝 Incremental edit applied to: %s\n", filename))
-	result.WriteString("🔄 Changes:\n")
-	result.WriteString(fmt.Sprintf("  - Removed: %q\n", truncateString(oldString, 80)))
-	result.WriteString(fmt.Sprintf("  + Added: %q\n", truncateString(newString, 80)))
-
-	// Always show the context diff for incremental edits
-	result.WriteString("\n" + GenerateDiff(oldContent, newContent, filename))
-
-	return result.String()
+	return GenerateDiff(oldContent, newContent, filename)
 }
 
 // truncateString truncates a string to maxLength with ellipsis

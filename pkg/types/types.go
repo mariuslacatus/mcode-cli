@@ -11,9 +11,10 @@ type Config struct {
 
 // Model represents an AI model configuration
 type Model struct {
-	Name    string `json:"name"`
-	BaseURL string `json:"base_url"`
-	APIKey  string `json:"api_key,omitempty"`
+	Name      string `json:"name"`
+	BaseURL   string `json:"base_url"`
+	APIKey    string `json:"api_key,omitempty"`
+	MaxTokens int    `json:"max_tokens,omitempty"` // Maximum context length in tokens
 }
 
 // Agent represents the AI agent with its state
