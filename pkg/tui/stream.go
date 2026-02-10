@@ -39,7 +39,8 @@ type StreamModel struct {
 	spinnerIndex int
 	showingSpinner bool
 	
-	width int
+	width  int
+	height int
 }
 
 func NewStreamModel(updates chan interface{}) *StreamModel {
@@ -62,6 +63,7 @@ func (m *StreamModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
+		m.height = msg.Height
 
 	case StreamContentMsg:
 		m.content.WriteString(string(msg))
@@ -102,19 +104,38 @@ func (m *StreamModel) View() string {
 	var view strings.Builder
 
 	// Render Markdown Content
+	rendered := ""
 	if m.content.Len() > 0 {
-		rendered, err := m.renderer.Render(m.content.String())
-		if err == nil {
-			view.WriteString(rendered)
+		var err error
+		rendered, err = m.renderer.Render(m.content.String())
+		if err != nil {
+			rendered = m.content.String()
+		}
+	}
+	
+	if rendered != "" {
+		lines := strings.Split(strings.TrimSpace(rendered), "\n")
+		
+		// If content is taller than terminal, truncate the top to avoid duplication
+		// We leave room for the spinner and a small margin (height - 4)
+		displayLimit := m.height - 4
+		if displayLimit < 5 {
+			displayLimit = 5 // Minimum fallback
+		}
+
+		if len(lines) > displayLimit {
+			hiddenCount := len(lines) - displayLimit
+			view.WriteString(fmt.Sprintf("\033[90m... (%d lines above)\033[0m\n", hiddenCount))
+			view.WriteString(strings.Join(lines[hiddenCount:], "\n"))
 		} else {
-			view.WriteString(m.content.String())
+			view.WriteString(strings.Join(lines, "\n"))
 		}
 	}
 	
 	// Render Tool Calls / Spinner at bottom
 	if m.showingSpinner && !m.finished {
 		// Add spacing if we have content
-		if m.content.Len() > 0 && !strings.HasSuffix(view.String(), "\n") {
+		if view.Len() > 0 && !strings.HasSuffix(view.String(), "\n") {
 			view.WriteString("\n")
 		}
 		spinnerChars := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
