@@ -10,13 +10,15 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"io"
 
 	"coding-agent/pkg/config"
-	"coding-agent/pkg/markdown"
 	"coding-agent/pkg/project"
 	"coding-agent/pkg/tools"
 	"coding-agent/pkg/types"
+	"coding-agent/pkg/tui"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/sashabaranov/go-openai"
 )
 
@@ -527,135 +529,85 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 		}
 		defer stream.Close()
 
-		// Save cursor position removed - using calculated height for clearing
+		// Create channel for TUI updates
+		updates := make(chan interface{})
 
-		// Process streaming response
-		var fullContent strings.Builder
-		var toolCalls []openai.ToolCall
+		// Initialize TUI model
+		model := tui.NewStreamModel(updates)
+		p := tea.NewProgram(model)
 
-		// Spinner for tool calls
-		var spinnerShown bool
-		var spinnerDone chan bool
-		var spinnerCleared chan bool
+		// Start streaming in background
+		go func() {
+			defer close(updates)
 
-		// For real-time rendering
-		renderer, _ := markdown.NewNoMarginTermRenderer()
-		tokenCount := 0
+			var fullContent strings.Builder
+			var toolCalls []openai.ToolCall
 
-		// Save cursor position at the start of assistant response
-		fmt.Print("\033[s")
-
-		for {
-			response, err := stream.Recv()
-			if err != nil {
-				if err.Error() == "EOF" {
-					break
-				}
-				return fmt.Errorf("error receiving stream: %v", err)
-			}
-
-			if len(response.Choices) > 0 {
-				delta := response.Choices[0].Delta
-
-				// Stream content as it arrives
-				if delta.Content != "" {
-					fullContent.WriteString(delta.Content)
-					tokenCount++
-
-					// Only re-render on newlines, first token, or every 10 tokens to save scrollback
-					if tokenCount == 1 || strings.Contains(delta.Content, "\n") || tokenCount%10 == 0 {
-						// Restore cursor to the start of the response and clear everything below
-						fmt.Print("\033[u\033[J")
-
-						// Render full content
-						rendered, err := renderer.Render(fullContent.String())
-						if err == nil {
-							fmt.Print(rendered)
-						} else {
-							fmt.Print(fullContent.String())
-						}
+			for {
+				response, err := stream.Recv()
+				if err != nil {
+					if err == io.EOF {
+						break
 					}
+					updates <- tui.StreamDoneMsg{Err: err}
+					return
 				}
 
-				// Collect tool calls - show animated spinner when tool calls detected
-				if len(delta.ToolCalls) > 0 {
-					if !spinnerShown {
-						// Final render of content before showing tools
-						fmt.Print("\033[u\033[J")
-						rendered, err := renderer.Render(fullContent.String())
-						if err == nil {
-							fmt.Print(rendered)
-						} else {
-							fmt.Print(fullContent.String())
-						}
-
-						// Move "save" point to after the content so tools don't overwrite it
-						fmt.Print("\033[s")
-
-						spinnerDone = make(chan bool)
-						spinnerCleared = make(chan bool)
-						go startSpinner(spinnerDone, spinnerCleared)
-						spinnerShown = true
+				if len(response.Choices) > 0 {
+					delta := response.Choices[0].Delta
+					if delta.Content != "" {
+						fullContent.WriteString(delta.Content)
+						updates <- tui.StreamContentMsg(delta.Content)
 					}
-
-					for _, toolCall := range delta.ToolCalls {
-						// Handle the fact that Index might be nil or a pointer
-						idx := 0
-						if toolCall.Index != nil {
-							idx = *toolCall.Index
+					if len(delta.ToolCalls) > 0 {
+						for _, toolCall := range delta.ToolCalls {
+							idx := 0
+							if toolCall.Index != nil {
+								idx = *toolCall.Index
+							}
+							for len(toolCalls) <= idx {
+								toolCalls = append(toolCalls, openai.ToolCall{Function: openai.FunctionCall{}})
+							}
+							if toolCall.ID != "" {
+								toolCalls[idx].ID = toolCall.ID
+							}
+							if toolCall.Type != "" {
+								toolCalls[idx].Type = toolCall.Type
+							}
+							if toolCall.Function.Name != "" {
+								toolCalls[idx].Function.Name = toolCall.Function.Name
+							}
+							if toolCall.Function.Arguments != "" {
+								toolCalls[idx].Function.Arguments += toolCall.Function.Arguments
+							}
 						}
-
-						// Extend slice if needed
-						for len(toolCalls) <= idx {
-							toolCalls = append(toolCalls, openai.ToolCall{
-								Function: openai.FunctionCall{},
-							})
-						}
-
-						// Accumulate tool call data
-						if toolCall.ID != "" {
-							toolCalls[idx].ID = toolCall.ID
-						}
-						if toolCall.Type != "" {
-							toolCalls[idx].Type = toolCall.Type
-						}
-						if toolCall.Function.Name != "" {
-							toolCalls[idx].Function.Name = toolCall.Function.Name
-						}
-						if toolCall.Function.Arguments != "" {
-							toolCalls[idx].Function.Arguments += toolCall.Function.Arguments
-						}
+						updates <- tui.StreamToolMsg{ToolCalls: toolCalls}
 					}
 				}
 			}
 
-			// Note: Usage information is typically only available in the final chunk
-			// for streaming responses, but some implementations may provide it elsewhere
+			updates <- tui.StreamDoneMsg{
+				FullContent: fullContent.String(),
+				ToolCalls:   toolCalls,
+			}
+		}()
+
+		// Run TUI
+		finalModel, err := p.Run()
+		if err != nil {
+			return fmt.Errorf("error running TUI: %v", err)
 		}
 
-		// Final re-render to ensure full content is shown
-		if fullContent.Len() > 0 {
-			// Restore cursor and clear
-			fmt.Print("\033[u\033[J")
-			rendered, err := renderer.Render(fullContent.String())
-			if err == nil {
-				fmt.Print(rendered)
-			} else {
-				fmt.Print(fullContent.String())
-			}
+		m, ok := finalModel.(*tui.StreamModel)
+		if !ok {
+			return fmt.Errorf("internal error: unexpected model type")
 		}
-
-		// Stop spinner if it's still running
-		if spinnerShown && spinnerDone != nil {
-			spinnerDone <- true
-			if spinnerCleared != nil {
-				<-spinnerCleared
-			}
-			close(spinnerDone)
+		if err := m.Err(); err != nil {
+			return fmt.Errorf("streaming error: %v", err)
 		}
 
 		// Rough estimation: ~4 characters per token for response
-		responseTokens := len(fullContent.String()) / 4
+		responseTokens := len(m.Content()) / 4
 		if responseTokens < 1 {
 			responseTokens = 1
 		}
@@ -674,9 +626,10 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 		a.TotalTokensUsed += responseTokens
 
 		// Create assistant message with accumulated content and tool calls
+		toolCalls := m.ToolCalls()
 		assistantMessage := openai.ChatCompletionMessage{
 			Role:      openai.ChatMessageRoleAssistant,
-			Content:   fullContent.String(),
+			Content:   m.Content(),
 			ToolCalls: toolCalls,
 		}
 
