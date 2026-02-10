@@ -540,8 +540,10 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 
 		// For real-time rendering
 		renderer, _ := markdown.NewNoMarginTermRenderer()
-		lastRenderedLines := 0
 		tokenCount := 0
+
+		// Save cursor position at the start of assistant response
+		fmt.Print("\033[s")
 
 		for {
 			response, err := stream.Recv()
@@ -562,20 +564,15 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 
 					// Only re-render on newlines, first token, or every 10 tokens to save scrollback
 					if tokenCount == 1 || strings.Contains(delta.Content, "\n") || tokenCount%10 == 0 {
-						// Clear previous rendered output
-						if lastRenderedLines > 0 {
-							fmt.Printf("\033[%dA", lastRenderedLines)
-						}
-						fmt.Print("\r\033[J")
+						// Restore cursor to the start of the response and clear everything below
+						fmt.Print("\033[u\033[J")
 
 						// Render full content
 						rendered, err := renderer.Render(fullContent.String())
 						if err == nil {
 							fmt.Print(rendered)
-							lastRenderedLines = strings.Count(rendered, "\n")
 						} else {
 							fmt.Print(fullContent.String())
-							lastRenderedLines = strings.Count(fullContent.String(), "\n")
 						}
 					}
 				}
@@ -583,11 +580,17 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 				// Collect tool calls - show animated spinner when tool calls detected
 				if len(delta.ToolCalls) > 0 {
 					if !spinnerShown {
-						// Ensure we start tool call output on a new line
-						if lastRenderedLines > 0 {
-							fmt.Println()
-							lastRenderedLines = 0
+						// Final render of content before showing tools
+						fmt.Print("\033[u\033[J")
+						rendered, err := renderer.Render(fullContent.String())
+						if err == nil {
+							fmt.Print(rendered)
+						} else {
+							fmt.Print(fullContent.String())
 						}
+
+						// Move "save" point to after the content so tools don't overwrite it
+						fmt.Print("\033[s")
 
 						spinnerDone = make(chan bool)
 						spinnerCleared = make(chan bool)
@@ -632,10 +635,8 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 
 		// Final re-render to ensure full content is shown
 		if fullContent.Len() > 0 {
-			if lastRenderedLines > 0 {
-				fmt.Printf("\033[%dA", lastRenderedLines)
-			}
-			fmt.Print("\r\033[J")
+			// Restore cursor and clear
+			fmt.Print("\033[u\033[J")
 			rendered, err := renderer.Render(fullContent.String())
 			if err == nil {
 				fmt.Print(rendered)
