@@ -889,7 +889,7 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 
 		shouldAutoExecute := false
 		var permissionError string
-		if toolCall.Function.Name == "list_files" || toolCall.Function.Name == "read_file" || toolCall.Function.Name == "preview_edit" {
+		if toolCall.Function.Name == "list_files" || toolCall.Function.Name == "read_file" || toolCall.Function.Name == "preview_edit" || toolCall.Function.Name == "search_code" {
 			var folderPath string
 			if pathParam, exists := params["path"]; exists {
 				if pathStr, ok := pathParam.(string); ok {
@@ -898,19 +898,27 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 					} else {
 						folderPath = pathStr
 					}
+				}
+			} else if dirParam, exists := params["directory"]; exists {
+				if dirStr, ok := dirParam.(string); ok {
+					folderPath = dirStr
+				}
+			} else if toolCall.Function.Name == "search_code" {
+				folderPath = "."
+			}
 
-					if IsFolderApproved(a, folderPath) {
-						shouldAutoExecute = true
+			if folderPath != "" {
+				if IsFolderApproved(a, folderPath) {
+					shouldAutoExecute = true
+				} else {
+					// We must stop spinner before requesting permission via UI
+					spinner.Stop()
+					if !RequestFolderPermission(a, folderPath) {
+						permissionError = "Permission denied for folder access"
 					} else {
-						// We must stop spinner before requesting permission via UI
-						spinner.Stop()
-						if !RequestFolderPermission(a, folderPath) {
-							permissionError = "Permission denied for folder access"
-						} else {
-							shouldAutoExecute = true
-							// Restart spinner for subsequent processing (like GetPreview)
-							spinner.Start()
-						}
+						shouldAutoExecute = true
+						// Restart spinner for subsequent processing (like GetPreview)
+						spinner.Start()
 					}
 				}
 			}
