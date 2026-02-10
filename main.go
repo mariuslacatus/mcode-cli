@@ -26,6 +26,10 @@ var completer = readline.NewPrefixCompleter(
 	readline.PcItem("/permissions"),
 	readline.PcItem("/compact"),
 	readline.PcItem("/exit"),
+	readline.PcItem("/save"),
+	readline.PcItem("/resume"),
+	readline.PcItem("/conv"),
+	readline.PcItem("/del"),
 	readline.PcItem("#"),
 )
 

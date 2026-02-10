@@ -26,6 +26,7 @@ type Agent struct {
 	Config          *Config
 	ConfigPath      string
 	ApprovedFolders map[string]bool // Track folders user has granted access to
+	CurrentConvID   string          // ID of the currently active saved conversation
 }
 
 // ANSI color codes for console output
@@ -36,4 +37,6 @@ const (
 	ColorYellow = "\033[33m"
 	ColorBlue   = "\033[34m"
 	ColorCyan   = "\033[36m"
+	ColorGray   = "\033[90m"
+	ColorMagenta = "\033[35m"
 )
