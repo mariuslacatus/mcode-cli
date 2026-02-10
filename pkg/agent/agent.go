@@ -953,10 +953,10 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 		if shouldAutoExecute {
 			response = "y"
 		} else {
-			prompt := "\n❓ Execute this tool? (Y/n/s to skip/i to interrupt): "
+			prompt := "\n❓ Execute this tool? (Y/n/s to skip/Esc to interrupt): "
 			if isLongRunning {
 				fmt.Printf("%s⚠️  This looks like a long-running command!%s\n", types.ColorYellow, types.ColorReset)
-				prompt = "\n❓ Execute this tool? (Y/n/s to skip/i to interrupt/b for background): "
+				prompt = "\n❓ Execute this tool? (Y/n/s to skip/Esc to interrupt/b for background): "
 			}
 			playNotificationSound()
 			PrintSafe(prompt)

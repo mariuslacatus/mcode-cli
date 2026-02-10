@@ -51,13 +51,20 @@ func StartInterruptMonitor(ctx context.Context) (context.Context, func()) {
 					if err != nil {
 						// Only return on EOF, ignore other errors to avoid spurious cancellation
 						if err == io.EOF {
+							f, _ := os.OpenFile("/tmp/mcode_interrupt.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+							fmt.Fprintf(f, "Cancellation due to EOF\n")
+							f.Close()
 							return
 						}
 						continue
 					}
 					if n > 0 {
 						if buf[0] == 27 { // Escape
-							return // Cancel triggered via defer
+							// Check if more characters are available immediately (escape sequence like arrow keys)
+							if inputAvailableShort(fd) {
+								continue
+							}
+							return // Standalone Escape
 						}
 						// Also handle Ctrl+C (ETX)
 						if buf[0] == 3 {
@@ -84,12 +91,19 @@ func StartInterruptMonitor(ctx context.Context) (context.Context, func()) {
 }
 
 func inputAvailable(fd int) bool {
+	return inputAvailableTimeout(fd, 100000) // 100ms
+}
+
+func inputAvailableShort(fd int) bool {
+	return inputAvailableTimeout(fd, 10000) // 10ms
+}
+
+func inputAvailableTimeout(fd int, usec int) bool {
 	var fds unix.FdSet
 	// Set bit for fd
 	fds.Bits[fd/32] |= 1 << (uint(fd) % 32)
 	
-	// Timeout 100ms
-	tv := unix.Timeval{Sec: 0, Usec: 100000}
+	tv := unix.Timeval{Sec: 0, Usec: int32(usec)}
 	
 	n, err := unix.Select(fd+1, &fds, nil, nil, &tv)
 	return n > 0 && err == nil
@@ -137,16 +151,29 @@ func ReadConfirmation() string {
 	defer term.Restore(fd, state)
 	
 	buf := make([]byte, 1)
-	n, err := os.Stdin.Read(buf)
-	if err != nil || n == 0 {
-		return ""
+	for {
+		n, err := os.Stdin.Read(buf)
+		if err != nil || n == 0 {
+			return ""
+		}
+		
+		key := buf[0]
+		if key == 27 { // Escape
+			// Check if it's a sequence
+			if inputAvailableShort(fd) {
+				// Read and discard the rest of the sequence
+				for inputAvailableShort(fd) {
+					os.Stdin.Read(buf)
+				}
+				continue // Ignore sequence and wait for another key
+			}
+			return "i" // Standalone Escape -> interrupt
+		}
+		if key == 3 { // Ctrl+C
+			return "i"
+		}
+		
+		// Map other keys
+		return strings.ToLower(string(key))
 	}
-	
-	key := buf[0]
-	if key == 27 || key == 3 { // Escape or Ctrl+C
-		return "i" // Treat as interrupt
-	}
-	
-	// Map other keys
-	return strings.ToLower(string(key))
 }
