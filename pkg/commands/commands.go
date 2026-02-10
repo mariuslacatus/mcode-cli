@@ -10,6 +10,7 @@ import (
 	"coding-agent/pkg/agent"
 	"coding-agent/pkg/config"
 	"coding-agent/pkg/conversation"
+	"coding-agent/pkg/markdown"
 	"coding-agent/pkg/project"
 	"coding-agent/pkg/types"
 
