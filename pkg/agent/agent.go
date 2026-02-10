@@ -11,8 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/term"
-
 	"coding-agent/pkg/config"
 	"coding-agent/pkg/markdown"
 	"coding-agent/pkg/project"
@@ -540,6 +538,10 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 		var spinnerDone chan bool
 		var spinnerCleared chan bool
 
+		// For real-time rendering
+		renderer, _ := markdown.NewNoMarginTermRenderer()
+		lastRenderedLines := 0
+
 		for {
 			response, err := stream.Recv()
 			if err != nil {
@@ -556,14 +558,32 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 				if delta.Content != "" {
 					fullContent.WriteString(delta.Content)
 
-					// Print raw content as it comes in
-					fmt.Print(delta.Content)
+					// Clear previous rendered output
+					if lastRenderedLines > 0 {
+						fmt.Printf("\033[%dA", lastRenderedLines)
+					}
+					fmt.Print("\r\033[J")
+
+					// Render full content
+					rendered, err := renderer.Render(fullContent.String())
+					if err == nil {
+						fmt.Print(rendered)
+						lastRenderedLines = strings.Count(rendered, "\n")
+					} else {
+						fmt.Print(fullContent.String())
+						lastRenderedLines = strings.Count(fullContent.String(), "\n")
+					}
 				}
 
 				// Collect tool calls - show animated spinner when tool calls detected
 				if len(delta.ToolCalls) > 0 {
 					if !spinnerShown {
-						fmt.Print("\n")
+						// Ensure we start tool call output on a new line
+						if lastRenderedLines > 0 {
+							fmt.Println()
+							lastRenderedLines = 0
+						}
+
 						spinnerDone = make(chan bool)
 						spinnerCleared = make(chan bool)
 						go startSpinner(spinnerDone, spinnerCleared)
@@ -612,50 +632,6 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 				<-spinnerCleared
 			}
 			close(spinnerDone)
-		}
-
-		// Replace the raw output with rendered markdown
-
-		// Calculate lines to clear safely
-		width, _, err := term.GetSize(int(os.Stdout.Fd()))
-		if err != nil {
-			width = 80
-		}
-
-		lines := 0
-		curWidth := 0
-		for _, r := range fullContent.String() {
-			if r == '\n' {
-				lines++
-				curWidth = 0
-			} else {
-				if curWidth >= width {
-					lines++
-					curWidth = 0
-				}
-				curWidth++
-			}
-		}
-
-		// Clear the raw output
-		if lines > 0 {
-			fmt.Printf("\033[%dA", lines) // Move cursor up
-		}
-		fmt.Print("\r\033[J") // Clear from cursor down
-
-		// Render the full content
-		if fullContent.Len() > 0 {
-			renderer, err := markdown.NewTermRenderer()
-			if err == nil {
-				rendered, err := renderer.Render(fullContent.String())
-				if err == nil {
-					fmt.Print(rendered)
-				} else {
-					fmt.Print(fullContent.String())
-				}
-			} else {
-				fmt.Print(fullContent.String())
-			}
 		}
 
 		// Rough estimation: ~4 characters per token for response
