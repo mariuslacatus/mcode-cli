@@ -13,6 +13,7 @@ import (
 	"io"
 
 	"coding-agent/pkg/config"
+	"coding-agent/pkg/markdown"
 	"coding-agent/pkg/project"
 	"coding-agent/pkg/tools"
 	"coding-agent/pkg/types"
@@ -534,7 +535,7 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 
 		// Initialize TUI model
 		model := tui.NewStreamModel(updates)
-		p := tea.NewProgram(model)
+		p := tea.NewProgram(model, tea.WithAltScreen())
 
 		// Start streaming in background
 		go func() {
@@ -604,6 +605,16 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 		}
 		if err := m.Err(); err != nil {
 			return fmt.Errorf("streaming error: %v", err)
+		}
+
+		// Print the final result to the main buffer so it stays in history
+		if m.Content() != "" {
+			rendered, err := markdown.Render(m.Content())
+			if err == nil {
+				fmt.Print(rendered)
+			} else {
+				fmt.Print(m.Content())
+			}
 		}
 
 		// Rough estimation: ~4 characters per token for response

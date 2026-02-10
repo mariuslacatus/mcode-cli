@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"coding-agent/pkg/markdown"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/sashabaranov/go-openai"
 )
@@ -35,13 +36,13 @@ type StreamModel struct {
 	finished    bool
 	err         error
 	
+	// Components
+	viewport    viewport.Model
+	ready       bool
+	
 	// Spinner state
 	spinnerIndex int
 	showingSpinner bool
-	
-	// Viewport sizing
-	width  int
-	height int
 }
 
 func NewStreamModel(updates chan interface{}) *StreamModel {
@@ -56,20 +57,30 @@ func NewStreamModel(updates chan interface{}) *StreamModel {
 func (m *StreamModel) Init() tea.Cmd {
 	return tea.Batch(
 		waitForUpdate(m.updates),
-		// Start spinner tick
 		tickSpinner(),
 	)
 }
 
 func (m *StreamModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var (
+		cmd  tea.Cmd
+		cmds []tea.Cmd
+	)
+
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-		return m, nil
+		if !m.ready {
+			m.viewport = viewport.New(msg.Width, msg.Height-2) // Leave room for status/spinner
+			m.viewport.SetContent("Waiting for response...")
+			m.ready = true
+		} else {
+			m.viewport.Width = msg.Width
+			m.viewport.Height = msg.Height - 2
+		}
 
 	case StreamContentMsg:
 		m.content.WriteString(string(msg))
+		m.updateViewport()
 		return m, waitForUpdate(m.updates)
 
 	case StreamToolMsg:
@@ -80,52 +91,63 @@ func (m *StreamModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case StreamDoneMsg:
 		m.finished = true
 		m.err = msg.Err
+		if m.err == nil {
+			// Final render
+			m.updateViewport()
+		}
 		return m, tea.Quit
 
 	case spinnerTickMsg:
 		if m.showingSpinner {
 			m.spinnerIndex++
-			return m, tickSpinner()
+			cmds = append(cmds, tickSpinner())
+		} else {
+			cmds = append(cmds, tickSpinner())
 		}
-		return m, nil
 		
 	case tea.KeyMsg:
-		if msg.Type == tea.KeyCtrlC {
+		switch msg.Type {
+		case tea.KeyCtrlC:
 			m.err = fmt.Errorf("interrupted by user")
 			return m, tea.Quit
 		}
 	}
 
-	return m, nil
+	m.viewport, cmd = m.viewport.Update(msg)
+	cmds = append(cmds, cmd)
+
+	return m, tea.Batch(cmds...)
 }
 
-func (m *StreamModel) View() string {
-	if m.err != nil {
-		return fmt.Sprintf("Error: %v\n", m.err)
-	}
-
-	var view strings.Builder
-
-	// Render Markdown Content
+func (m *StreamModel) updateViewport() {
 	if m.content.Len() > 0 {
 		rendered, err := m.renderer.Render(m.content.String())
 		if err == nil {
-			view.WriteString(rendered)
+			m.viewport.SetContent(rendered)
 		} else {
-			view.WriteString(m.content.String())
+			m.viewport.SetContent(m.content.String())
 		}
+		m.viewport.GotoBottom()
 	}
-	
-	// Ensure there is a newline if we have content
-	if m.content.Len() > 0 && !strings.HasSuffix(view.String(), "\n") {
-		view.WriteString("\n")
+}
+
+func (m *StreamModel) View() string {
+	if !m.ready {
+		return "\n  Initializing..."
 	}
 
-	// Render Tool Calls / Spinner
+	if m.err != nil {
+		return fmt.Sprintf("\n  Error: %v\n", m.err)
+	}
+
+	var view strings.Builder
+	view.WriteString(m.viewport.View())
+
+	// Render Tool Calls / Spinner at bottom
 	if m.showingSpinner && !m.finished {
 		spinnerChars := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 		spinner := spinnerChars[m.spinnerIndex%len(spinnerChars)]
-		view.WriteString(fmt.Sprintf("\n%s Processing tool calls...", spinner))
+		view.WriteString(fmt.Sprintf("\n %s Processing tool calls...", spinner))
 	}
 
 	return view.String()
@@ -152,7 +174,6 @@ func waitForUpdate(sub chan interface{}) tea.Cmd {
 			return nil
 		}
 		
-		// Map internal channel types to tea.Msg
 		switch val := msg.(type) {
 		case StreamContentMsg:
 			return val
