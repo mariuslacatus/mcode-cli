@@ -6,7 +6,7 @@ require (
 	github.com/charmbracelet/glamour v0.10.0
 	github.com/chzyer/readline v1.5.1
 	github.com/pmezard/go-difflib v1.0.0
-	github.com/sashabaranov/go-openai v1.20.4
+	github.com/sashabaranov/go-openai v1.41.2
 	golang.org/x/sys v0.38.0
 	golang.org/x/term v0.31.0
 )

@@ -60,6 +60,9 @@ func (h *Handler) Handle(command string) (bool, error) {
 	case "/export":
 		err := h.projectManager.ExportContext(parts)
 		return false, err
+	case "/prompt":
+		h.handlePromptCommand()
+		return false, nil
 	case "/models":
 		err := h.handleModelsCommand(parts)
 		return false, err
@@ -101,6 +104,32 @@ func (h *Handler) clearContext() {
 	fmt.Print("\033[2J\033[H")
 
 	fmt.Printf("%s🔄 Conversation context cleared - Starting fresh!%s\n", types.ColorGreen, types.ColorReset)
+}
+
+// handlePromptCommand handles /prompt command
+func (h *Handler) handlePromptCommand() {
+	fmt.Println("\n🧠 Current System Prompt(s)")
+	fmt.Println("===========================")
+
+	renderer, _ := markdown.NewTermRenderer()
+
+	found := false
+	for _, msg := range h.agent.Conversation {
+		if msg.Role == openai.ChatMessageRoleSystem {
+			found = true
+			fmt.Printf("\n%s[System Message]%s\n", types.ColorCyan, types.ColorReset)
+			if rendered, err := renderer.Render(msg.Content); err == nil {
+				fmt.Print(rendered)
+			} else {
+				fmt.Println(msg.Content)
+			}
+		}
+	}
+
+	if !found {
+		fmt.Println("No system messages found in current conversation.")
+	}
+	fmt.Println()
 }
 
 // handleModelsCommand handles /models command
@@ -263,6 +292,7 @@ func (h *Handler) showHelp() {
 	fmt.Println("  /init        - Initialize project and create AGENTS.md")
 	fmt.Println("  /new         - Clear conversation context (start fresh)")
 	fmt.Println("  /export      - Export conversation context to text file")
+	fmt.Println("  /prompt      - List current system instructions/prompts")
 	fmt.Println("  /models      - List or switch between available models")
 	fmt.Println("  /permissions - Manage folder permissions")
 	fmt.Println("  /compact     - Compact conversation context to save tokens")
@@ -283,7 +313,7 @@ func (h *Handler) showHelp() {
 	fmt.Println("  /conv info <id>   - Show conversation details and metadata")
 	fmt.Println()
 	fmt.Println("Available Tools:")
-	fmt.Println("  📖 read_file    - Read file contents")
+	fmt.Println("  📖 read_file    - Read file contents (with safety limits)")
 	fmt.Println("  📁 list_files   - List directory contents")
 	fmt.Println("  ⚡ bash_command - Execute shell commands")
 	fmt.Println("  ✏️ edit_file    - Create/modify files (shows colored diffs)")

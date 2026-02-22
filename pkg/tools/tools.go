@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -44,13 +45,21 @@ func (m *Manager) GetToolDefinitions() []openai.Tool {
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
 				Name:        "read_file",
-				Description: "Read the contents of a file",
+				Description: "Read the contents of a file. For large files, use offset and limit to paginate. Defaults to 500 lines.",
 				Parameters: map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
 						"path": map[string]interface{}{
 							"type":        "string",
 							"description": "Path to the file to read",
+						},
+						"offset": map[string]interface{}{
+							"type":        "integer",
+							"description": "Optional: 0-based line number to start reading from.",
+						},
+						"limit": map[string]interface{}{
+							"type":        "integer",
+							"description": "Optional: Maximum number of lines to read (default 500).",
 						},
 					},
 					"required": []string{"path"},
@@ -145,7 +154,7 @@ func (m *Manager) GetToolDefinitions() []openai.Tool {
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
 				Name:        "search_code",
-				Description: "Search for code patterns in files",
+				Description: "Search for code patterns in files. Returns up to 100 results with line numbers. Use more specific patterns if needed.",
 				Parameters: map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
@@ -155,7 +164,7 @@ func (m *Manager) GetToolDefinitions() []openai.Tool {
 						},
 						"directory": map[string]interface{}{
 							"type":        "string",
-							"description": "Directory to search in",
+							"description": "Directory to search in (defaults to current directory)",
 						},
 					},
 					"required": []string{"pattern"},
@@ -165,19 +174,82 @@ func (m *Manager) GetToolDefinitions() []openai.Tool {
 	}
 }
 
-// ReadFile reads the contents of a file
+// ReadFile reads the contents of a file. Use offset and limit to paginate.
 func (m *Manager) ReadFile(params map[string]interface{}) (string, error) {
 	path, ok := params["path"].(string)
 	if !ok {
 		return "", fmt.Errorf("path parameter is required")
 	}
 
-	content, err := os.ReadFile(path)
+	// Check if limit was explicitly provided
+	limitParam, limitExists := params["limit"]
+	limit := 300 // Default limit
+
+	if limitExists {
+		switch v := limitParam.(type) {
+		case float64:
+			limit = int(v)
+		case int:
+			limit = v
+		}
+	}
+
+	offset := 0
+	if offsetParam, exists := params["offset"]; exists {
+		switch v := offsetParam.(type) {
+		case float64:
+			offset = int(v)
+		case int:
+			offset = v
+		}
+	}
+
+	// Count total lines first to provide metadata
+	f, err := os.Open(path)
 	if err != nil {
+		return "", fmt.Errorf("error opening file: %v", err)
+	}
+	
+	lineScanner := bufio.NewScanner(f)
+	totalLines := 0
+	for lineScanner.Scan() {
+		totalLines++
+	}
+	f.Close()
+
+	// Re-open to read the actual content
+	f, err = os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("error opening file: %v", err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	var lines []string
+	currentLine := 0
+
+	for scanner.Scan() {
+		if currentLine >= offset {
+			lines = append(lines, scanner.Text())
+			if limit > 0 && len(lines) >= limit {
+				break
+			}
+		}
+		currentLine++
+	}
+
+	if err := scanner.Err(); err != nil {
 		return "", fmt.Errorf("error reading file: %v", err)
 	}
 
-	return string(content), nil
+	content := strings.Join(lines, "\n")
+	
+	// Add helpful truncation message if we didn't read the whole file
+	if limit > 0 && (offset+len(lines) < totalLines) {
+		content += fmt.Sprintf("\n\n[... File truncated. %d/%d lines read starting from line %d. Use offset and limit to read more. ...]", len(lines), totalLines, offset)
+	}
+
+	return content, nil
 }
 
 // ListFiles lists files in a directory
@@ -319,14 +391,14 @@ func (m *Manager) GetPreview(name string, params map[string]interface{}) (string
 			// Read existing content
 			content, err := os.ReadFile(filePath)
 			if err != nil {
-				return "", nil // Or maybe it's a new file?
+				return fmt.Sprintf("⚠️  Preview Failed: Error reading file %s: %v", filePath, err), nil
 			}
 			oldContent := string(content)
 
 			// Perform incremental replacement
 			newContent, err := ReplaceInContent(oldContent, oldString, newString, replaceAll)
 			if err != nil {
-				return "", nil // Can't preview if replace fails
+				return fmt.Sprintf("⚠️  Preview Failed: %v\n(The tool will likely fail if executed)", err), nil
 			}
 
 			// Generate and return a focused diff
@@ -568,7 +640,7 @@ func (m *Manager) PreviewEdit(params map[string]interface{}) (string, error) {
 	return fmt.Sprintf("Preview: No changes would be made to %s", path), nil
 }
 
-// SearchCode searches for code patterns in files
+// SearchCode searches for code patterns in files. It limits output to 100 matches.
 func (m *Manager) SearchCode(params map[string]interface{}) (string, error) {
 	pattern, ok := params["pattern"].(string)
 	if !ok {
@@ -580,13 +652,19 @@ func (m *Manager) SearchCode(params map[string]interface{}) (string, error) {
 		directory = "."
 	}
 
-	cmd := exec.Command("grep", "-r", pattern, directory)
+	// Use grep -rnI (recursive, line numbers, ignore binary) and limit to 100 lines
+	cmd := exec.Command("bash", "-c", fmt.Sprintf("grep -rnI %q %s | head -n 100", pattern, directory))
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(output), nil // grep returns error when no matches found
 	}
 
-	return string(output), nil
+	result := string(output)
+	if strings.Count(result, "\n") >= 100 {
+		result += "\n\n[... Search results truncated to 100 lines. Use more specific patterns if needed. ...]"
+	}
+
+	return result, nil
 }
 
 // IsLongRunningCommand checks if a command is likely to be long-running
@@ -779,25 +857,35 @@ func ReplaceInContent(content, oldString, newString string, replaceAll bool) (st
 
 	for _, replacer := range replacers {
 		matches := replacer.FindMatches(content, oldString)
-		for _, match := range matches {
-			// Check if the match appears only once (unless replaceAll is true)
-			if !replaceAll {
-				firstIndex := strings.Index(content, match)
-				lastIndex := strings.LastIndex(content, match)
-				if firstIndex != lastIndex {
-					continue // Multiple occurrences, skip this match
-				}
-			}
-
-			// Perform the replacement
-			if replaceAll {
-				return strings.ReplaceAll(content, match, newString), nil
-			}
-			return strings.Replace(content, match, newString, 1), nil
+		if len(matches) == 0 {
+			continue
 		}
+
+		// If we found matches, handle them
+		if !replaceAll && len(matches) > 1 {
+			return "", fmt.Errorf("ambiguous replacement: found %d matches for the provided text. Please provide more context (more surrounding lines) to make the match unique", len(matches))
+		}
+
+		// Check for uniqueness of the specific match string in the whole content
+		match := matches[0]
+		if !replaceAll {
+			firstIndex := strings.Index(content, match)
+			lastIndex := strings.LastIndex(content, match)
+			if firstIndex != lastIndex {
+				// Count occurrences
+				count := strings.Count(content, match)
+				return "", fmt.Errorf("ambiguous replacement: the text matches %d different locations in the file. Please include more surrounding lines in 'oldString' to uniquely identify the target", count)
+			}
+		}
+
+		// Perform the replacement
+		if replaceAll {
+			return strings.ReplaceAll(content, match, newString), nil
+		}
+		return strings.Replace(content, match, newString, 1), nil
 	}
 
-	return "", fmt.Errorf("oldString not found in content or multiple ambiguous matches found")
+	return "", fmt.Errorf("text not found: the provided 'oldString' does not match any content in the file. Check for typos, indentation, or missing lines")
 }
 
 // GenerateFocusedDiff generates a diff focused around the changed area

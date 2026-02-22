@@ -77,9 +77,8 @@ func New() *types.Agent {
 	toolManager := tools.NewManager(agent)
 	toolManager.RegisterTools()
 
-	// Load project context
-	projectManager := project.NewManager(agent)
-	projectManager.LoadProjectContext()
+	// Initialize conversation with system prompt
+	InitConversation(agent)
 
 	return agent
 }
@@ -383,34 +382,55 @@ func UpdateStatusDisplay(a *types.Agent) {
 	fmt.Printf("\033]0;%s\007", title)
 }
 
+// InitConversation initializes the conversation with system prompts
+func InitConversation(a *types.Agent) {
+	projectManager := project.NewManager(a)
+	
+	// Load AGENTS.md content for context
+	agentsContent := projectManager.LoadAgentsMD()
+
+	basePrompt := `You are a helpful coding agent. You have access to tools to help the user with their coding tasks. 
+
+THOUGHT PROCESS:
+Before calling any tool, briefly state your reasoning and plan. This helps you select the most efficient tool for the task.
+
+CORE STRATEGY & EFFICIENCY:
+1.  **Understand Before Reading:** Use 'list_files' to map the project and 'search_code' to find relevant symbols.
+2.  **Read Smartly:** Use 'read_file'. If a file is large (> 300 lines), it will automatically truncate and show the total line count. Use 'offset' and 'limit' to read specific chunks. NEVER read massive files entirely.
+3.  **Edit Surgically:** Prefer 'edit_file' (incremental edits) over 'write_file' (full replacement).
+4.  **Run Commands:** Use 'bash_command' for building, testing, or running the code.
+
+CORRECT WORKFLOW EXAMPLE:
+User: "Fix the bug in main.go"
+Assistant: "I'll start by reading main.go."
+[Tool Call: read_file(path="main.go")]
+Assistant: "main.go is 1200 lines (only 300 read). I'll now read the next 300 lines to understand more."
+[Tool Call: read_file(path="main.go", offset=300, limit=300)]
+
+Follow these principles to stay within the context window and maintain high performance. Always be clear about your intent and rationale.`
+
+	// Add AGENTS.md context if available
+	systemPrompt := basePrompt
+	if agentsContent != "" {
+		systemPrompt += fmt.Sprintf("\n\n--- PROJECT CONTEXT (AGENTS.md) ---\n%s\n--- END PROJECT CONTEXT ---\n\nIMPORTANT: Pay special attention to any 'Permanent Instructions' in the project context above and follow them consistently.", agentsContent)
+	}
+
+	// Always clear and start with this system prompt as message 0
+	a.Conversation = []openai.ChatCompletionMessage{
+		{
+			Role:    openai.ChatMessageRoleSystem,
+			Content: systemPrompt,
+		},
+	}
+}
+
 // Chat handles conversation with the AI model
 func Chat(a *types.Agent, ctx context.Context, message string) error {
 	toolManager := tools.NewManager(a)
-	projectManager := project.NewManager(a)
 
-	// Add system message if this is the first message
+	// Add system message if this is the first message or it's missing
 	if len(a.Conversation) == 0 {
-		// Load AGENTS.md content for context
-		agentsContent := projectManager.LoadAgentsMD()
-
-		basePrompt := `You are a helpful coding agent. You have access to tools that allow you to:
-- Read and write files
-- Execute bash commands  
-- List directory contents
-- Search for code patterns
-
-Use these tools to help the user with their coding tasks. Always be clear about what you're doing and why.`
-
-		// Add AGENTS.md context if available
-		systemPrompt := basePrompt
-		if agentsContent != "" {
-			systemPrompt += fmt.Sprintf("\n\n--- PROJECT CONTEXT (AGENTS.md) ---\n%s\n--- END PROJECT CONTEXT ---\n\nIMPORTANT: Pay special attention to any 'Permanent Instructions' in the project context above and follow them consistently.", agentsContent)
-		}
-
-		a.Conversation = append(a.Conversation, openai.ChatCompletionMessage{
-			Role:    openai.ChatMessageRoleSystem,
-			Content: systemPrompt,
-		})
+		InitConversation(a)
 	}
 
 	a.Conversation = append(a.Conversation, openai.ChatCompletionMessage{
@@ -473,7 +493,11 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 		}
 
 		// Use a reasonable max tokens for completion
-		maxTokens := 4000
+		maxTokens := 8192
+		if currentModel.MaxCompletionTokens > 0 {
+			maxTokens = currentModel.MaxCompletionTokens
+		}
+
 		if currentModel.MaxTokens > 0 {
 			remainingTokens := currentModel.MaxTokens - currentTokens
 			if remainingTokens < maxTokens {
@@ -569,7 +593,7 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 
 				if len(choice.Message.ToolCalls) > 0 {
 					tokenStats := fmt.Sprintf("(%d ctx | %d gen)", a.LastTokenUsage.PromptTokens, a.LastTokenUsage.CompletionTokens)
-					if err := handleToolCalls(a, choice.Message.ToolCalls, toolManager, tokenStats); err != nil {
+					if err := handleToolCalls(a, choice.Message.ToolCalls, toolManager, tokenStats, choice.FinishReason == "length"); err != nil {
 						return err
 					}
 				} else {
@@ -607,13 +631,19 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 				speed = float64(genTokens) / duration
 			}
 
-			// Update window title
+			// Update window title via spinner
 			modelName := a.Config.Models[a.Config.CurrentModel].Name
 			title := fmt.Sprintf("MCode | %s | %d ctx | %d gen (%.1f t/s)", modelName, contextTokens, genTokens, speed)
-			fmt.Printf("\033]0;%s\007", title)
+			spinner.SetTitle(title)
 
 			// Update spinner if active
-			spinner.UpdateMessage(fmt.Sprintf("%d tokens (%.1f t/s)", genTokens, speed))
+			msg := ""
+			if genTokens == 0 {
+				msg = "Thinking..."
+			} else {
+				msg = fmt.Sprintf("%d tokens (%.1f t/s)", genTokens, speed)
+			}
+			spinner.UpdateMessage(msg)
 		}
 
 		var finishReason string
@@ -623,16 +653,39 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 			if err != nil {
 				// We still stop on error or EOF
 				spinner.Stop()
-				cancelStream() // Stop monitor on error or EOF
+				
+				// CRITICAL: Check context status BEFORE calling cancelStream()
+				isCanceled := streamCtx.Err() == context.Canceled
+				cancelStream() 
+				
 				if err == io.EOF {
 					break
 				}
+				
 				// Check for interruption
-				if err == context.Canceled || streamCtx.Err() == context.Canceled {
+				if isCanceled {
 					fmt.Println("\n❌ Generation interrupted by user")
 					return nil
 				}
 				return fmt.Errorf("error receiving stream: %v", err)
+			}
+
+			// If provider gives us usage in the stream (like OpenRouter), use it
+			if response.Usage != nil && response.Usage.CompletionTokens > 0 {
+				// Update genTokens based on actual usage
+				speed := 0.0
+				duration := time.Since(genStartTime).Seconds()
+				if duration > 0 {
+					speed = float64(response.Usage.CompletionTokens) / duration
+				}
+				
+				modelName := a.Config.Models[a.Config.CurrentModel].Name
+				title := fmt.Sprintf("MCode | %s | %d ctx | %d gen (%.1f t/s)", modelName, contextTokens, response.Usage.CompletionTokens, speed)
+				spinner.SetTitle(title)
+				spinner.UpdateMessage(fmt.Sprintf("%d tokens (%.1f t/s)", response.Usage.CompletionTokens, speed))
+			} else {
+				// Fallback to manual calculation for providers like LM Studio
+				updateStats()
 			}
 
 			if len(response.Choices) > 0 {
@@ -642,14 +695,21 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 				}
 				delta := choice.Delta
 				
+				// Ensure spinner is running for any generation signal
+				if delta.Content != "" || len(delta.ToolCalls) > 0 || delta.FunctionCall != nil {
+					spinner.Start()
+				}
+
 				if delta.Content != "" {
 					fullContent.WriteString(delta.Content)
 					updateStats()
 
 					rendered, err := renderer.Render(fullContent.String())
 					if err != nil {
+						// Only stop spinner if we're actually going to print something
 						spinner.Stop()
 						PrintSafe(delta.Content)
+						spinner.Start()
 						continue
 					}
 
@@ -668,23 +728,19 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 					// 4. Calculate backtrack
 					linesToBacktrack := len(previousLines) - diffIdx
 					
-					// 5. Clamp backtrack to visible screen height to avoid scrollback corruption
+					// 5. Clamp backtrack to visible screen height
 					termHeight := getTermHeight()
 					if linesToBacktrack >= termHeight {
-						// If diff is off-screen, we can't update it. 
-						// Just append the new lines that fit or reset?
-						// Better strategy: "Give up" on the deep history update and just print from where we are?
-						// No, that duplicates.
-						// We must limit linesToBacktrack.
 						linesToBacktrack = termHeight - 1
 						diffIdx = len(previousLines) - linesToBacktrack
 						if diffIdx < 0 {
-							diffIdx = 0 // Should not happen with clamp logic above but safe guard
+							diffIdx = 0 
 						}
 					}
 
-					// Only update screen and stop spinner if there are changes
+					// Only update screen if there are changes
 					if linesToBacktrack > 0 || diffIdx < len(currentLines) {
+						// CRITICAL: Only stop spinner if we are about to update the terminal lines
 						spinner.Stop()
 
 						// 6. Move cursor and clear
@@ -699,14 +755,20 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 						}
 
 						previousLines = currentLines
+
+						// Restart spinner immediately
+						spinner.Start()
 					}
+				}
+
+				// Function calls (older format)
+				if delta.FunctionCall != nil && delta.FunctionCall.Arguments != "" {
+					toolArgsLen += len(delta.FunctionCall.Arguments)
+					updateStats()
 				}
 
 				// Tool calls
 				if len(delta.ToolCalls) > 0 {
-					// Ensure spinner is running for tool call streaming
-					spinner.Start()
-
 					for _, toolCall := range delta.ToolCalls {
 						idx := 0
 						if toolCall.Index != nil {
@@ -725,8 +787,8 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 							toolCalls[idx].Function.Name = toolCall.Function.Name
 						}
 						if toolCall.Function.Arguments != "" {
-							toolCalls[idx].Function.Arguments += toolCall.Function.Arguments
 							toolArgsLen += len(toolCall.Function.Arguments)
+							toolCalls[idx].Function.Arguments += toolCall.Function.Arguments
 							updateStats()
 						}
 					}
@@ -776,7 +838,7 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 			if a.LastTokenUsage != nil {
 				tokenStats = fmt.Sprintf("(%d ctx | %d gen)", a.LastTokenUsage.PromptTokens, a.LastTokenUsage.CompletionTokens)
 			}
-			if err := handleToolCalls(a, toolCalls, toolManager, tokenStats); err != nil {
+			if err := handleToolCalls(a, toolCalls, toolManager, tokenStats, finishReason == "length"); err != nil {
 				return err
 			}
 		} else {
@@ -804,8 +866,16 @@ Use these tools to help the user with their coding tasks. Always be clear about 
 	return nil
 }
 
+// TruncateForLLM truncates string content to a safe length for LLM context
+func TruncateForLLM(s string, maxChars int) string {
+	if len(s) <= maxChars {
+		return s
+	}
+	return s[:maxChars] + fmt.Sprintf("\n\n[... Output truncated to %d characters for context efficiency. Use pagination or search if more detail is needed. ...]", maxChars)
+}
+
 // handleToolCalls processes tool calls from the AI model
-func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *tools.Manager, tokenStats string) error {
+func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *tools.Manager, tokenStats string, truncated bool) error {
 	for _, toolCall := range toolCalls {
 		// Start a spinner while we process this tool call (parse, check permissions, get preview)
 		msg := fmt.Sprintf("Processing %s", toolCall.Function.Name)
@@ -818,10 +888,30 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 		var params map[string]interface{}
 		if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &params); err != nil {
 			spinner.Stop()
-			fmt.Printf("Error parsing tool parameters: %v\n", err)
-			if len(toolCall.Function.Arguments) > 0 {
-				fmt.Printf("Partial JSON (len=%d): %s...\n", len(toolCall.Function.Arguments), toolCall.Function.Arguments)
+			
+			errResult := ""
+			if truncated {
+				errResult = fmt.Sprintf("Error parsing tool parameters (Generation Truncated): %v", err)
+			} else {
+				errResult = fmt.Sprintf("Error parsing tool parameters: %v", err)
 			}
+			
+			fmt.Println(errResult)
+			if len(toolCall.Function.Arguments) > 0 {
+				argLen := len(toolCall.Function.Arguments)
+				previewLen := 300
+				if argLen < previewLen {
+					previewLen = argLen
+				}
+				fmt.Printf("Partial JSON (len=%d): %s...\n", argLen, toolCall.Function.Arguments[:previewLen])
+			}
+			
+			// Always add a tool response to avoid breaking the conversation
+			a.Conversation = append(a.Conversation, openai.ChatCompletionMessage{
+				Role:       openai.ChatMessageRoleTool,
+				Content:    errResult,
+				ToolCallID: toolCall.ID,
+			})
 			continue
 		}
 
@@ -979,16 +1069,55 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 
 		// Display tool output to user
 		if result != "" && (response == "" || response == "y" || response == "yes" || response == "b" || response == "background") {
-			fmt.Println() // Add blank line after tool call
-			if toolCall.Function.Name == "edit_file" || toolCall.Function.Name == "write_file" {
+			// Always show errors in red
+			if strings.HasPrefix(result, "Error:") {
+				fmt.Printf("\n%s> %s%s\n", types.ColorRed, result, types.ColorReset)
+			} else if toolCall.Function.Name == "edit_file" || toolCall.Function.Name == "write_file" {
+				fmt.Println() // Add blank line after tool call
 				// Only stream diff/output if it wasn't already shown in preview
 				if preview == "" {
 					streamOutput(result)
 				} else {
 					fmt.Printf("✅ %s applied successfully\n\n", toolCall.Function.Name)
 				}
+			} else if toolCall.Function.Name == "read_file" {
+				fmt.Println() // Add blank line after tool call
+				offset := 0
+				if v, ok := params["offset"].(float64); ok {
+					offset = int(v)
+				}
+
+				// Find where the truncation message starts to count actual file lines
+				actualResult := result
+				if idx := strings.Index(result, "\n\n[... File truncated."); idx != -1 {
+					actualResult = result[:idx]
+				}
+
+				// Count lines (including empty ones)
+				var lineCount int
+				if actualResult == "" {
+					lineCount = 0
+				} else {
+					lineCount = strings.Count(actualResult, "\n") + 1
+				}
+
+				if lineCount > 0 {
+					fmt.Printf("%s> Read lines %d-%d (%d lines)%s\n",
+						types.ColorCyan, offset, offset+lineCount-1, lineCount, types.ColorReset)
+				} else {
+					fmt.Printf("%s> Read 0 lines (empty or at end of file)%s\n", types.ColorCyan, types.ColorReset)
+				}
+			} else if toolCall.Function.Name == "search_code" {
+				fmt.Println() // Add blank line after tool call
+				lineCount := strings.Count(result, "\n")
+				fmt.Printf("%s> Found %d matches%s\n", types.ColorCyan, lineCount, types.ColorReset)
+			} else if toolCall.Function.Name == "list_files" {
+				fmt.Println() // Add blank line after tool call
+				lineCount := strings.Count(result, "\n")
+				fmt.Printf("%s> Listed %d items%s\n", types.ColorCyan, lineCount, types.ColorReset)
 			} else if toolCall.Function.Name != "read_file" && toolCall.Function.Name != "list_files" && toolCall.Function.Name != "bash_command" {
-				// Generic output display (skip read_file, list_files, and bash_command to avoid clutter/duplication)
+				fmt.Println() // Add blank line after tool call
+				// Generic output display (skip read_file, list_files and bash_command to avoid clutter/duplication)
 				fmt.Printf("%s> Tool Output:%s\n", types.ColorCyan, types.ColorReset)
 				if len(result) > 2000 {
 					fmt.Println(result[:2000] + "... (truncated)")
@@ -998,10 +1127,11 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 			}
 		}
 
-		// Add tool result to conversation
+		// Add tool result to conversation with truncation safety
+		truncatedResult := TruncateForLLM(result, 32000)
 		a.Conversation = append(a.Conversation, openai.ChatCompletionMessage{
 			Role:       openai.ChatMessageRoleTool,
-			Content:    result,
+			Content:    truncatedResult,
 			ToolCallID: toolCall.ID,
 		})
 
@@ -1116,6 +1246,7 @@ type Spinner struct {
 	cleared chan bool
 	active  bool
 	message string
+	title   string
 }
 
 // NewSpinner creates a new spinner
@@ -1128,48 +1259,64 @@ func NewSpinner(message string) *Spinner {
 // Start starts the spinner if it's not already running
 func (s *Spinner) Start() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.active {
+		s.mu.Unlock()
 		return
 	}
 
 	s.done = make(chan bool)
 	s.cleared = make(chan bool)
 	s.active = true
+	
+	msg := s.message
+	title := s.title
+	s.mu.Unlock()
 
+	// Print first frame and update title immediately
 	go func() {
 		spinnerChars := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 		i := 0
-		ticker := time.NewTicker(100 * time.Millisecond)
-		defer ticker.Stop()
-
-		// Print first frame immediately
-		if s.message != "" {
-			PrintfSafe("\r\033[K%s %s", spinnerChars[0], s.message)
+		
+		// Initial frame
+		if title != "" {
+			PrintfSafe("\033]0;%s\007", title)
+		}
+		if msg != "" {
+			PrintfSafe("\r\033[K%s %s", spinnerChars[0], msg)
 		} else {
 			PrintfSafe("\r\033[K%s", spinnerChars[0])
 		}
-		os.Stdout.Sync()
 		i++
+
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
 
 		for {
 			select {
 			case <-s.done:
 				// Clear the spinner completely
 				PrintSafe("\r\033[K")
-				os.Stdout.Sync()
 				if s.cleared != nil {
 					s.cleared <- true
 				}
 				return
 			case <-ticker.C:
-				if s.message != "" {
-					PrintfSafe("\r\033[K%s %s", spinnerChars[i%len(spinnerChars)], s.message)
+				s.mu.Lock()
+				msg := s.message
+				title := s.title
+				s.mu.Unlock()
+
+				// Update window title if provided
+				if title != "" {
+					PrintfSafe("\033]0;%s\007", title)
+				}
+
+				// Update spinner line
+				if msg != "" {
+					PrintfSafe("\r\033[K%s %s", spinnerChars[i%len(spinnerChars)], msg)
 				} else {
 					PrintfSafe("\r\033[K%s", spinnerChars[i%len(spinnerChars)])
 				}
-				os.Stdout.Sync()
 				i++
 			}
 		}
@@ -1179,22 +1326,36 @@ func (s *Spinner) Start() {
 // Stop stops the spinner if it is running
 func (s *Spinner) Stop() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if !s.active {
+		s.mu.Unlock()
 		return
 	}
+	done := s.done
+	cleared := s.cleared
+	s.mu.Unlock()
 
-	s.done <- true
-	<-s.cleared
+	done <- true
+	if cleared != nil {
+		<-cleared
+	}
+
+	s.mu.Lock()
 	s.active = false
+	s.mu.Unlock()
 }
 
 // UpdateMessage updates the spinner message
 func (s *Spinner) UpdateMessage(message string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.message = message
+	s.mu.Unlock()
+}
+
+// SetTitle updates the window title via the spinner
+func (s *Spinner) SetTitle(title string) {
+	s.mu.Lock()
+	s.title = title
+	s.mu.Unlock()
 }
 
 // streamOutput simulates streaming output for content
@@ -1209,7 +1370,6 @@ func streamOutput(content string) {
 
 		chunk := content[i:end]
 		PrintSafe(chunk)
-		os.Stdout.Sync() // Force immediate flush after each chunk
 
 		// Very small delay
 		time.Sleep(1 * time.Millisecond)

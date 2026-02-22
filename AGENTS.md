@@ -33,6 +33,12 @@ mcode/
 
 ## AI Agent Instructions
 
+### Context Efficiency
+- **Avoid reading large files entirely.**
+- **Use pagination** for large files.
+- **Prefer search over full read.**
+- **Use incremental edits** for targeted modifications.
+
 ### Permanent Instructions
 - always use Go best practices for this project
 - test instruction for comprehensive check
@@ -49,9 +55,12 @@ mcode/
 ## Available Tools
 
 ### 1. read_file
-Read the contents of a file.
-- Parameters: `path` (string) - Path to the file to read
-- Returns: File contents as string
+Read the contents of a file. For large files (>300 lines), it will automatically truncate and show the total line count. Use `offset` and `limit` to paginate. Defaults to 300 lines.
+- Parameters:
+  - `path` (string): Path to the file to read.
+  - `offset` (int, optional): 0-based line number to start reading from.
+  - `limit` (int, optional): Maximum number of lines to read (default 300).
+- Returns: File contents as string (with truncation notice and total line count).
 
 ### 2. write_file
 Write content to a file, creating it if it doesn't exist or overwriting if it does.
@@ -83,11 +92,11 @@ Perform incremental edits to a file using find-and-replace.
 - Use this for targeted edits when you know the exact text to replace
 
 ### 6. search_code
-Search for code patterns in files.
+Search for code patterns in files. Returns up to 100 results with line numbers.
 - Parameters:
-  - `pattern` (string) - Pattern to search for
-  - `directory` (string) - Directory to search in (defaults to current directory)
-- Returns: Matching lines of code
+  - `pattern` (string): Pattern to search for.
+  - `directory` (string, optional): Directory to search in.
+- Returns: Matching lines of code (up to 100 results)
 
 ## Usage Examples
 
@@ -104,6 +113,7 @@ write_file with path: /path/to/existing.go and content: "new content here"
 ### Reading a file
 ```
 read_file with path: /path/to/file.go
+read_file with path: /path/to/large_file.go, offset: 100, limit: 50
 ```
 
 ### Listing files

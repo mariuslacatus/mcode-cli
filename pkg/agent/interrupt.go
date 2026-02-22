@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"sync"
@@ -39,23 +38,29 @@ func StartInterruptMonitor(ctx context.Context) (context.Context, func()) {
 	go func() {
 		defer cancel()
 		
+		logFile, _ := os.OpenFile("/Users/marius/Documents/development/mcode/interrupt.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if logFile != nil {
+			fmt.Fprintf(logFile, "--- Monitor Started ---\n")
+			defer logFile.Close()
+		}
+
 		buf := make([]byte, 1)
 		for {
 			select {
 			case <-ctx.Done():
+				if logFile != nil {
+					fmt.Fprintf(logFile, "Monitor exiting: context done\n")
+				}
 				return
 			default:
 				// Check if data is available to read using select
 				if inputAvailable(fd) {
 					n, err := os.Stdin.Read(buf)
 					if err != nil {
-						// Only return on EOF, ignore other errors to avoid spurious cancellation
-						if err == io.EOF {
-							f, _ := os.OpenFile("/tmp/mcode_interrupt.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-							fmt.Fprintf(f, "Cancellation due to EOF\n")
-							f.Close()
-							return
+						if logFile != nil {
+							fmt.Fprintf(logFile, "Read error: %v\n", err)
 						}
+						// Ignore errors (including EOF) to avoid spurious cancellation
 						continue
 					}
 					if n > 0 {
@@ -64,10 +69,16 @@ func StartInterruptMonitor(ctx context.Context) (context.Context, func()) {
 							if inputAvailableShort(fd) {
 								continue
 							}
+							if logFile != nil {
+								fmt.Fprintf(logFile, "Interrupt: Escape key pressed\n")
+							}
 							return // Standalone Escape
 						}
 						// Also handle Ctrl+C (ETX)
 						if buf[0] == 3 {
+							if logFile != nil {
+								fmt.Fprintf(logFile, "Interrupt: Ctrl+C pressed\n")
+							}
 							return
 						}
 					}
@@ -109,17 +120,24 @@ func inputAvailableTimeout(fd int, usec int) bool {
 	return n > 0 && err == nil
 }
 
+var outputMu sync.Mutex
+
 // PrintSafe prints text handling newlines for raw mode
 func PrintSafe(a ...interface{}) {
+	outputMu.Lock()
+	defer outputMu.Unlock()
 	s := fmt.Sprint(a...)
 	if isRawMode.Load() {
 		s = strings.ReplaceAll(s, "\n", "\r\n")
 	}
 	fmt.Print(s)
+	os.Stdout.Sync()
 }
 
 // PrintlnSafe prints line handling newlines for raw mode
 func PrintlnSafe(a ...interface{}) {
+	outputMu.Lock()
+	defer outputMu.Unlock()
 	s := fmt.Sprint(a...)
 	if isRawMode.Load() {
 		s = strings.ReplaceAll(s, "\n", "\r\n") + "\r\n"
@@ -127,15 +145,19 @@ func PrintlnSafe(a ...interface{}) {
 	} else {
 		fmt.Println(s)
 	}
+	os.Stdout.Sync()
 }
 
 // PrintfSafe prints formatted string handling newlines for raw mode
 func PrintfSafe(format string, a ...interface{}) {
+	outputMu.Lock()
+	defer outputMu.Unlock()
 	s := fmt.Sprintf(format, a...)
 	if isRawMode.Load() {
 		s = strings.ReplaceAll(s, "\n", "\r\n")
 	}
 	fmt.Print(s)
+	os.Stdout.Sync()
 }
 
 // ReadConfirmation reads a single key for confirmation.
