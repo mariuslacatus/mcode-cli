@@ -4,17 +4,19 @@ A Go-based coding agent that uses LM Studio locally to help with programming tas
 
 ## Features
 
-Based on the principles from the referenced articles, this agent implements:
+Based on minimalist principles, this agent is optimized for **local LLM performance**:
 
-- **Core Agent Architecture**: ~300-line implementation with local LLM integration
-- **Five Essential Tools**:
-  1. `read_file` - Read file contents
-  2. `list_files` - List directory contents  
-  3. `bash_command` - Execute shell commands
-  5. `write_file` - Create/overwrite files
-  4. `edit_file` - Create/modify files
-  6. `search_code` - Search for code patterns
-- **Local Model**: Uses `lmstudio-community/qwen3-coder-30b-a3b-instruct-mlx@8bit`
+- **Context Efficiency Core**: Engineered to prevent context inflation, ensuring high speed even on consumer hardware.
+- **Token-Aware Truncation**: Automatically trims tool outputs and history to maintain high-signal context.
+- **Core Agent Architecture**: minimalist Go implementation with low overhead.
+- **Essential Tools**:
+  1. `read_file` - Paginated file reading
+  2. `list_files` - Truncated directory listing
+  3. `bash_command` - Shell execution
+  5. `write_file` - Targeted file creation
+  4. `edit_file` - Precision incremental editing (find/replace)
+  6. `search_code` - High-speed grep-based searching
+- **Local Model**: Optimized for `qwen3-coder` and other local weights.
 
 ## Prerequisites
 

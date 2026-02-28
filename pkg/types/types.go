@@ -1,6 +1,9 @@
 package types
 
-import "github.com/sashabaranov/go-openai"
+import (
+	"coding-agent/pkg/llm"
+	"github.com/sashabaranov/go-openai"
+)
 
 // Config represents the application configuration
 type Config struct {
@@ -20,7 +23,7 @@ type Model struct {
 
 // Agent represents the AI agent with its state
 type Agent struct {
-	Client          *openai.Client
+	LLM             llm.Provider
 	Conversation    []openai.ChatCompletionMessage
 	Tools           map[string]func(map[string]interface{}) (string, error)
 	LastTokenUsage  *openai.Usage

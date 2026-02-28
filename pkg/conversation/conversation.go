@@ -11,9 +11,23 @@ import (
 
 // Message represents a single conversation message
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-	ToolID  string `json:"tool_call_id,omitempty"`
+	Role      string            `json:"role"`
+	Content   string            `json:"content"`
+	ToolID    string            `json:"tool_call_id,omitempty"`
+	ToolCalls []ToolCall        `json:"tool_calls,omitempty"`
+}
+
+// ToolCall represents a saved tool call
+type ToolCall struct {
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function FunctionCall `json:"function"`
+}
+
+// FunctionCall represents a saved function call
+type FunctionCall struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 // Conversation represents a complete conversation session

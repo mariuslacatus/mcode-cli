@@ -11,15 +11,16 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
-	"io"
 
 	"coding-agent/pkg/config"
+	"coding-agent/pkg/llm"
 	"coding-agent/pkg/markdown"
 	"coding-agent/pkg/project"
+	"coding-agent/pkg/tokens"
 	"coding-agent/pkg/tools"
 	"coding-agent/pkg/types"
+	"coding-agent/pkg/ui"
 
 	"github.com/sashabaranov/go-openai"
 	"golang.org/x/term"
@@ -65,7 +66,7 @@ func New() *types.Agent {
 	}
 
 	agent := &types.Agent{
-		Client:          client,
+		LLM:             llm.NewOpenAIProvider(client),
 		Conversation:    []openai.ChatCompletionMessage{},
 		Tools:           make(map[string]func(map[string]interface{}) (string, error)),
 		Config:          cfg,
@@ -83,12 +84,20 @@ func New() *types.Agent {
 	return agent
 }
 
-// GetContextTokens returns the number of context tokens from the last API call
+// GetContextTokens returns the number of context tokens using tiktoken
 func GetContextTokens(a *types.Agent) int {
-	if a.LastTokenUsage != nil {
+	// If we have actual usage from the last API call, use it
+	if a.LastTokenUsage != nil && a.LastTokenUsage.PromptTokens > 0 {
 		return a.LastTokenUsage.PromptTokens
 	}
-	return 0 // No API call made yet
+	
+	// Otherwise estimate using tiktoken
+	modelName := a.Config.CurrentModel
+	if model, ok := a.Config.Models[modelName]; ok {
+		modelName = model.Name
+	}
+	
+	return tokens.CountMessagesTokens(modelName, a.Conversation)
 }
 
 // GetTotalTokensUsed returns the total tokens used in the session
@@ -162,7 +171,7 @@ func RequestFolderPermission(a *types.Agent, folderPath string) bool {
 
 	fmt.Print("\a") // ASCII bell
 
-	response := ReadConfirmation()
+	response := ui.ReadConfirmation()
 	if response == "\r" || response == "\n" {
 		response = ""
 	}
@@ -191,41 +200,69 @@ func RequestFolderPermission(a *types.Agent, folderPath string) bool {
 	return false
 }
 
-// TrimContext trims conversation context when it gets too large
+// TrimContext reduces conversation history to stay within a token budget.
+// It prioritizes keeping system messages and the most recent interactions.
 func TrimContext(a *types.Agent, messages []openai.ChatCompletionMessage) []openai.ChatCompletionMessage {
 	if len(messages) <= 3 {
-		return messages // Keep at least a few messages
+		return messages
 	}
 
-	var trimmed []openai.ChatCompletionMessage
+	modelName := a.Config.CurrentModel
+	currentModel, ok := a.Config.Models[modelName]
+	if !ok {
+		// Fallback if model not found
+		currentModel = types.Model{Name: modelName, MaxTokens: 8000}
+	}
 
-	// Always keep system messages (like AGENTS.md content)
+	// Budget Calculation:
+	// We want to reserve space for:
+	// 1. The System Prompt (~20% or at least 2k)
+	// 2. The Current Task/User Message (~20%)
+	// 3. The Expected Completion (~20% or MaxCompletionTokens)
+	// 4. The History (The remainder, but capped for speed)
+	
+	totalLimit := currentModel.MaxTokens
+	if totalLimit <= 0 {
+		totalLimit = 8000 // Default fallback
+	}
+
+	// Budget is 50% of total context. 
+	// This allows history to scale with the model (e.g. 64k history for 128k model)
+	// while still leaving 50% for system prompts, current code, and the output.
+	tokenBudget := int(float64(totalLimit) * 0.5)
+	
+	// Sane upper bound for memory safety (e.g. 100k tokens of history is huge)
+	if tokenBudget > 100000 {
+		tokenBudget = 100000
+	}
+	
+	var systemMessages []openai.ChatCompletionMessage
+	var otherMessages []openai.ChatCompletionMessage
+
 	for _, msg := range messages {
 		if msg.Role == openai.ChatMessageRoleSystem {
-			trimmed = append(trimmed, msg)
+			systemMessages = append(systemMessages, msg)
+		} else {
+			otherMessages = append(otherMessages, msg)
 		}
 	}
 
-	// Keep the last 4-6 messages (recent conversation)
-	keepCount := 6
-	if len(messages) > keepCount {
-		recentMessages := messages[len(messages)-keepCount:]
-		for _, msg := range recentMessages {
-			if msg.Role != openai.ChatMessageRoleSystem { // Don't duplicate system messages
-				trimmed = append(trimmed, msg)
-			}
+	// Keep messages from the end until we hit the budget
+	var trimmed []openai.ChatCompletionMessage
+	currentTokens := 0
+	
+	for i := len(otherMessages) - 1; i >= 0; i-- {
+		msgTokens := tokens.CountMessagesTokens(currentModel.Name, []openai.ChatCompletionMessage{otherMessages[i]})
+		// Always keep at least 2 recent interactions (4 messages: 2 user, 2 assistant/tool)
+		if currentTokens+msgTokens > tokenBudget && len(trimmed) >= 4 {
+			break 
 		}
-	} else {
-		// If we have few messages, keep all non-system ones
-		for _, msg := range messages {
-			if msg.Role != openai.ChatMessageRoleSystem {
-				trimmed = append(trimmed, msg)
-			}
-		}
+		trimmed = append([]openai.ChatCompletionMessage{otherMessages[i]}, trimmed...)
+		currentTokens += msgTokens
 	}
 
-	fmt.Printf("📉 Context trimmed: %d → %d messages\n", len(messages), len(trimmed))
-	return trimmed
+	fmt.Printf("📉 Context trimmed: %d → %d messages (%d tokens history)\n", len(messages), len(systemMessages)+len(trimmed), currentTokens)
+	return append(systemMessages, trimmed...)
 }
 
 // CompactContext uses the LLM to summarize the conversation history
@@ -297,36 +334,28 @@ func CompactContext(a *types.Agent) error {
 	}
 
 	// Execute request with streaming
-	spinner := NewSpinner("Compacting context...")
+	spinner := ui.NewSpinner("Compacting context...")
 	spinner.Start()
 
-	stream, err := a.Client.CreateChatCompletionStream(context.Background(), req)
+	streamChan, err := a.LLM.CreateStream(context.Background(), req)
 	if err != nil {
 		spinner.Stop()
 		return fmt.Errorf("failed to start summary stream: %v", err)
 	}
-	defer stream.Close()
 
 	var summaryBuilder strings.Builder
 	fmt.Print(types.ColorCyan) // Use cyan for summary generation
 
-	for {
-		response, err := stream.Recv()
-		if err != nil {
+	for response := range streamChan {
+		if response.Error != nil {
 			spinner.Stop()
-			if err.Error() == "EOF" {
-				break
-			}
-			return fmt.Errorf("error receiving summary stream: %v", err)
+			return fmt.Errorf("error receiving summary stream: %v", response.Error)
 		}
 
-		if len(response.Choices) > 0 {
-			content := response.Choices[0].Delta.Content
-			if content != "" {
-				spinner.Stop()
-				fmt.Print(content)
-				summaryBuilder.WriteString(content)
-			}
+		if response.Content != "" {
+			spinner.Stop()
+			fmt.Print(response.Content)
+			summaryBuilder.WriteString(response.Content)
 		}
 	}
 
@@ -348,15 +377,11 @@ func CompactContext(a *types.Agent) error {
 	oldLen := len(a.Conversation)
 	a.Conversation = newHistory
 
-	// Print clear success message
-	// Calculate new token estimate
-	newTokens := 0
-	for _, msg := range newHistory {
-		newTokens += len(msg.Content) / 4
-	}
+	// Calculate new token estimate using tiktoken
+	newTokens := tokens.CountMessagesTokens(currentModel.Name, newHistory)
 
 	// Print clear success message
-	fmt.Printf("✅ Context compacted: %d → %d messages (~%d tokens)\n", oldLen, len(a.Conversation), newTokens)
+	fmt.Printf("✅ Context compacted: %d → %d messages (%d tokens)\n", oldLen, len(a.Conversation), newTokens)
 
 	// Force update status display
 	UpdateStatusDisplay(a)
@@ -364,22 +389,14 @@ func CompactContext(a *types.Agent) error {
 	return nil
 }
 
-// UpdateStatusDisplay shows the current context size in the upper right
 // UpdateStatusDisplay updates the fixed header at the top of the terminal
 func UpdateStatusDisplay(a *types.Agent) {
-	// Calculate token count
 	tokens := GetContextTokens(a)
-
-	// Format token string
-	usageStr := fmt.Sprintf("%d", tokens)
-	if tokens >= 1000 {
-		usageStr = fmt.Sprintf("%.1fk", float64(tokens)/1000.0)
+	modelName := "unknown"
+	if model, exists := a.Config.Models[a.Config.CurrentModel]; exists {
+		modelName = model.Name
 	}
-
-	// Update window title using ANSI escape sequence: \033]0;TITLE\007
-	// This shows status in the terminal tab/window title instead of a sticky header
-	title := fmt.Sprintf("MCode | %s | %s tokens", a.Config.Models[a.Config.CurrentModel].Name, usageStr)
-	fmt.Printf("\033]0;%s\007", title)
+	ui.UpdateStatusDisplay(modelName, tokens)
 }
 
 // InitConversation initializes the conversation with system prompts
@@ -394,11 +411,11 @@ func InitConversation(a *types.Agent) {
 THOUGHT PROCESS:
 Before calling any tool, briefly state your reasoning and plan. This helps you select the most efficient tool for the task.
 
-CORE STRATEGY & EFFICIENCY:
+CORE STRATEGY & EFFICIENCY (LOCAL LLM OPTIMIZED):
 1.  **Understand Before Reading:** Use 'list_files' to map the project and 'search_code' to find relevant symbols.
-2.  **Read Smartly:** Use 'read_file'. If a file is large (> 300 lines), it will automatically truncate and show the total line count. Use 'offset' and 'limit' to read specific chunks. NEVER read massive files entirely.
+2.  **Read Smartly:** Use 'read_file'. If a file is large (> 300 lines), it will automatically truncate. Use 'offset' and 'limit' to read specific chunks. NEVER read massive files entirely.
 3.  **Edit Surgically:** Prefer 'edit_file' (incremental edits) over 'write_file' (full replacement).
-4.  **Run Commands:** Use 'bash_command' for building, testing, or running the code.
+4.  **Stay High-Signal:** Your primary priority is preventing context inflation. Keep tool outputs and conversation history focused on the immediate task.
 
 CORRECT WORKFLOW EXAMPLE:
 User: "Fix the bug in main.go"
@@ -427,6 +444,7 @@ Follow these principles to stay within the context window and maintain high perf
 // Chat handles conversation with the AI model
 func Chat(a *types.Agent, ctx context.Context, message string) error {
 	toolManager := tools.NewManager(a)
+	toolManager.RegisterTools()
 
 	// Add system message if this is the first message or it's missing
 	if len(a.Conversation) == 0 {
@@ -474,7 +492,7 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 		}
 
 		// Start the "thinking" spinner early - it will stay until content arrives or turn ends
-		spinner := NewSpinner("")
+		spinner := ui.NewSpinner("")
 		spinner.Start()
 
 		if currentTokens > threshold {
@@ -518,8 +536,8 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 
 		// Create streaming request
 		// Start interrupt monitor for streaming phase
-		streamCtx, cancelStream := StartInterruptMonitor(ctx)
-		stream, err := a.Client.CreateChatCompletionStream(streamCtx, req)
+		streamCtx, cancelStream := ui.StartInterruptMonitor(ctx)
+		streamChan, err := a.LLM.CreateStream(streamCtx, req)
 		if err != nil {
 			cancelStream() // Stop monitor on error
 			spinner.Stop()
@@ -567,8 +585,8 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 				spinner.Start()
 
 				// Monitor interrupt during fallback
-				retryCtx, cancelRetry := StartInterruptMonitor(ctx)
-				resp, err := a.Client.CreateChatCompletion(retryCtx, reqFallback)
+				retryCtx, cancelRetry := ui.StartInterruptMonitor(ctx)
+				resp, err := a.LLM.CreateCompletion(retryCtx, reqFallback)
 				cancelRetry()
 				spinner.Stop()
 
@@ -576,24 +594,23 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 					return fmt.Errorf("error calling API (even after fallback): %v", err)
 				}
 
-				a.LastTokenUsage = &resp.Usage
+				a.LastTokenUsage = resp.Usage
 				a.TotalTokensUsed += resp.Usage.TotalTokens
 
-				choice := resp.Choices[0]
 				assistantMessage := openai.ChatCompletionMessage{
 					Role:      openai.ChatMessageRoleAssistant,
-					Content:   choice.Message.Content,
-					ToolCalls: choice.Message.ToolCalls,
+					Content:   resp.Content,
+					ToolCalls: resp.ToolCalls,
 				}
 				a.Conversation = append(a.Conversation, assistantMessage)
 
-				if choice.Message.Content != "" {
-					PrintSafe(choice.Message.Content)
+				if resp.Content != "" {
+					ui.PrintSafe(resp.Content)
 				}
 
-				if len(choice.Message.ToolCalls) > 0 {
+				if len(resp.ToolCalls) > 0 {
 					tokenStats := fmt.Sprintf("(%d ctx | %d gen)", a.LastTokenUsage.PromptTokens, a.LastTokenUsage.CompletionTokens)
-					if err := handleToolCalls(a, choice.Message.ToolCalls, toolManager, tokenStats, choice.FinishReason == "length"); err != nil {
+					if err := handleToolCalls(a, resp.ToolCalls, toolManager, tokenStats, resp.FinishReason == "length"); err != nil {
 						return err
 					}
 				} else {
@@ -604,7 +621,6 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 				return fmt.Errorf("error calling API: %v", err)
 			}
 		}
-		defer stream.Close()
 		
 		var previousLines []string
 		getTermHeight := func() int {
@@ -617,14 +633,22 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 
 		var fullContent strings.Builder
 		var toolCalls []openai.ToolCall
-		var toolArgsLen int
 		
 		genStartTime := time.Now()
 		contextTokens := GetContextTokens(a)
 
-		updateStats := func() {
-			genLen := fullContent.Len() + toolArgsLen
-			genTokens := genLen / 4
+		updateStats := func(usage *openai.Usage) {
+			genTokens := 0
+			if usage != nil {
+				genTokens = usage.CompletionTokens
+			} else {
+				genLen := fullContent.Len()
+				for _, tc := range toolCalls {
+					genLen += len(tc.Function.Name) + len(tc.Function.Arguments)
+				}
+				genTokens = genLen / 4
+			}
+
 			duration := time.Since(genStartTime).Seconds()
 			speed := 0.0
 			if duration > 0 {
@@ -648,165 +672,126 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 
 		var finishReason string
 
-		for {
-			response, err := stream.Recv()
-			if err != nil {
-				// We still stop on error or EOF
+		for response := range streamChan {
+			if response.Error != nil {
 				spinner.Stop()
-				
-				// CRITICAL: Check context status BEFORE calling cancelStream()
 				isCanceled := streamCtx.Err() == context.Canceled
 				cancelStream() 
 				
-				if err == io.EOF {
-					break
-				}
-				
-				// Check for interruption
 				if isCanceled {
 					fmt.Println("\n❌ Generation interrupted by user")
 					return nil
 				}
-				return fmt.Errorf("error receiving stream: %v", err)
+				return fmt.Errorf("error receiving stream: %v", response.Error)
 			}
 
-			// If provider gives us usage in the stream (like OpenRouter), use it
-			if response.Usage != nil && response.Usage.CompletionTokens > 0 {
-				// Update genTokens based on actual usage
-				speed := 0.0
-				duration := time.Since(genStartTime).Seconds()
-				if duration > 0 {
-					speed = float64(response.Usage.CompletionTokens) / duration
-				}
-				
-				modelName := a.Config.Models[a.Config.CurrentModel].Name
-				title := fmt.Sprintf("MCode | %s | %d ctx | %d gen (%.1f t/s)", modelName, contextTokens, response.Usage.CompletionTokens, speed)
-				spinner.SetTitle(title)
-				spinner.UpdateMessage(fmt.Sprintf("%d tokens (%.1f t/s)", response.Usage.CompletionTokens, speed))
-			} else {
-				// Fallback to manual calculation for providers like LM Studio
-				updateStats()
+			updateStats(response.Usage)
+
+			if response.FinishReason != "" {
+				finishReason = response.FinishReason
+			}
+			
+			// Ensure spinner is running for any generation signal
+			if response.Content != "" || len(response.ToolCalls) > 0 {
+				spinner.Start()
 			}
 
-			if len(response.Choices) > 0 {
-				choice := response.Choices[0]
-				if choice.FinishReason != "" {
-					finishReason = string(choice.FinishReason)
+			if response.Content != "" {
+				fullContent.WriteString(response.Content)
+				updateStats(response.Usage)
+
+				rendered, err := renderer.Render(fullContent.String())
+				if err != nil {
+					spinner.Stop()
+					ui.PrintSafe(response.Content)
+					spinner.Start()
+					continue
 				}
-				delta := choice.Delta
-				
-				// Ensure spinner is running for any generation signal
-				if delta.Content != "" || len(delta.ToolCalls) > 0 || delta.FunctionCall != nil {
+
+				currentLines := strings.Split(strings.TrimRight(rendered, "\n"), "\n")
+				diffIdx := 0
+				for diffIdx < len(previousLines) && diffIdx < len(currentLines) {
+					if previousLines[diffIdx] != currentLines[diffIdx] {
+						break
+					}
+					diffIdx++
+				}
+
+				linesToBacktrack := len(previousLines) - diffIdx
+				termHeight := getTermHeight()
+				if linesToBacktrack >= termHeight {
+					linesToBacktrack = termHeight - 1
+					diffIdx = len(previousLines) - linesToBacktrack
+					if diffIdx < 0 {
+						diffIdx = 0 
+					}
+				}
+
+				if linesToBacktrack > 0 || diffIdx < len(currentLines) {
+					spinner.Stop()
+					if linesToBacktrack > 0 {
+						ui.PrintfSafe("\033[%dA", linesToBacktrack)
+					}
+					ui.PrintSafe("\r\033[J")
+					for i := diffIdx; i < len(currentLines); i++ {
+						ui.PrintlnSafe(currentLines[i])
+					}
+					previousLines = currentLines
 					spinner.Start()
 				}
+			}
 
-				if delta.Content != "" {
-					fullContent.WriteString(delta.Content)
-					updateStats()
-
-					rendered, err := renderer.Render(fullContent.String())
-					if err != nil {
-						// Only stop spinner if we're actually going to print something
-						spinner.Stop()
-						PrintSafe(delta.Content)
-						spinner.Start()
-						continue
+			if len(response.ToolCalls) > 0 {
+				for _, tc := range response.ToolCalls {
+					idx := 0
+					if tc.Index != nil {
+						idx = *tc.Index
 					}
-
-					// 2. Split into lines
-					currentLines := strings.Split(strings.TrimRight(rendered, "\n"), "\n")
-					
-					// 3. Find first difference
-					diffIdx := 0
-					for diffIdx < len(previousLines) && diffIdx < len(currentLines) {
-						if previousLines[diffIdx] != currentLines[diffIdx] {
-							break
-						}
-						diffIdx++
+					for len(toolCalls) <= idx {
+						toolCalls = append(toolCalls, openai.ToolCall{
+							Type: openai.ToolTypeFunction,
+						})
 					}
-
-					// 4. Calculate backtrack
-					linesToBacktrack := len(previousLines) - diffIdx
-					
-					// 5. Clamp backtrack to visible screen height
-					termHeight := getTermHeight()
-					if linesToBacktrack >= termHeight {
-						linesToBacktrack = termHeight - 1
-						diffIdx = len(previousLines) - linesToBacktrack
-						if diffIdx < 0 {
-							diffIdx = 0 
-						}
+					if tc.ID != "" {
+						toolCalls[idx].ID = tc.ID
 					}
-
-					// Only update screen if there are changes
-					if linesToBacktrack > 0 || diffIdx < len(currentLines) {
-						// CRITICAL: Only stop spinner if we are about to update the terminal lines
-						spinner.Stop()
-
-						// 6. Move cursor and clear
-						if linesToBacktrack > 0 {
-							PrintfSafe("\033[%dA", linesToBacktrack)
-						}
-						PrintSafe("\r\033[J")
-
-						// 7. Print new/changed lines
-						for i := diffIdx; i < len(currentLines); i++ {
-							PrintlnSafe(currentLines[i])
-						}
-
-						previousLines = currentLines
-
-						// Restart spinner immediately
-						spinner.Start()
+					if tc.Function.Name != "" {
+						toolCalls[idx].Function.Name = tc.Function.Name
 					}
-				}
-
-				// Function calls (older format)
-				if delta.FunctionCall != nil && delta.FunctionCall.Arguments != "" {
-					toolArgsLen += len(delta.FunctionCall.Arguments)
-					updateStats()
-				}
-
-				// Tool calls
-				if len(delta.ToolCalls) > 0 {
-					for _, toolCall := range delta.ToolCalls {
-						idx := 0
-						if toolCall.Index != nil {
-							idx = *toolCall.Index
-						}
-						for len(toolCalls) <= idx {
-							toolCalls = append(toolCalls, openai.ToolCall{Function: openai.FunctionCall{}})
-						}
-						if toolCall.ID != "" {
-							toolCalls[idx].ID = toolCall.ID
-						}
-						if toolCall.Type != "" {
-							toolCalls[idx].Type = toolCall.Type
-						}
-						if toolCall.Function.Name != "" {
-							toolCalls[idx].Function.Name = toolCall.Function.Name
-						}
-						if toolCall.Function.Arguments != "" {
-							toolArgsLen += len(toolCall.Function.Arguments)
-							toolCalls[idx].Function.Arguments += toolCall.Function.Arguments
-							updateStats()
-						}
+					if tc.Function.Arguments != "" {
+						toolCalls[idx].Function.Arguments += tc.Function.Arguments
 					}
+					updateStats(response.Usage)
 				}
 			}
 		}
+		cancelStream()
 
-		// Rough estimation: ~4 characters per token for response
-		responseTokens := (fullContent.Len() + toolArgsLen) / 4
+		// Final check for tool call validity - ensure every tool call has an ID and type
+		validToolCalls := make([]openai.ToolCall, 0)
+		for _, tc := range toolCalls {
+			if tc.Function.Name != "" {
+				if tc.Type == "" {
+					tc.Type = openai.ToolTypeFunction
+				}
+				validToolCalls = append(validToolCalls, tc)
+			}
+		}
+		toolCalls = validToolCalls
+
+		// Accurate token counting using tiktoken
+		responseTokens := tokens.CountTokens(currentModel.Name, fullContent.String())
+		for _, tc := range toolCalls {
+			responseTokens += tokens.CountTokens(currentModel.Name, tc.Function.Name)
+			responseTokens += tokens.CountTokens(currentModel.Name, tc.Function.Arguments)
+		}
+
 		if responseTokens < 1 {
 			responseTokens = 1
 		}
 
-		// Estimate context tokens by looking at conversation history
-		contextEstimate := 0
-		for _, msg := range a.Conversation {
-			contextEstimate += len(msg.Content) / 4
-		}
+		// Use accurate context counting
+		contextEstimate := tokens.CountMessagesTokens(currentModel.Name, a.Conversation)
 
 		a.LastTokenUsage = &openai.Usage{
 			PromptTokens:     contextEstimate,
@@ -820,6 +805,12 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 			Role:      openai.ChatMessageRoleAssistant,
 			Content:   fullContent.String(),
 			ToolCalls: toolCalls,
+		}
+
+		// CRITICAL FIX: Ensure content is never truly undefined/nil for providers that are picky.
+		// If content is empty and there are no tool calls, some providers reject it.
+		if assistantMessage.Content == "" && len(assistantMessage.ToolCalls) == 0 {
+			assistantMessage.Content = " " // Use a single space as a fallback
 		}
 
 		a.Conversation = append(a.Conversation, assistantMessage)
@@ -866,12 +857,30 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 	return nil
 }
 
-// TruncateForLLM truncates string content to a safe length for LLM context
-func TruncateForLLM(s string, maxChars int) string {
-	if len(s) <= maxChars {
+// TruncateForLLM truncates string content to a safe length for LLM context.
+// Local LLMs work much better with shorter, high-signal contexts.
+func TruncateForLLM(a *types.Agent, s string, maxChars int) string {
+	limit := 8000 // Default fallback
+	
+	// If model config is available, allow tool output to take up to ~50% of context
+	if model, ok := a.Config.Models[a.Config.CurrentModel]; ok && model.MaxTokens > 0 {
+		// Roughly 4 chars per token
+		limit = int(float64(model.MaxTokens) * 0.5 * 4)
+	}
+
+	if maxChars > 0 && maxChars < limit {
+		limit = maxChars
+	}
+	
+	// Sane upper bound for character count (e.g. 100k chars is plenty for one tool output)
+	if limit > 100000 {
+		limit = 100000
+	}
+	
+	if len(s) <= limit {
 		return s
 	}
-	return s[:maxChars] + fmt.Sprintf("\n\n[... Output truncated to %d characters for context efficiency. Use pagination or search if more detail is needed. ...]", maxChars)
+	return s[:limit] + fmt.Sprintf("\n\n[... Output truncated to %d characters for context efficiency. Use pagination or search if more detail is needed. ...]", limit)
 }
 
 // handleToolCalls processes tool calls from the AI model
@@ -882,7 +891,7 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 		if tokenStats != "" {
 			msg += " " + tokenStats
 		}
-		spinner := NewSpinner(msg)
+		spinner := ui.NewSpinner(msg)
 		spinner.Start()
 
 		var params map[string]interface{}
@@ -896,6 +905,10 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 				errResult = fmt.Sprintf("Error parsing tool parameters: %v", err)
 			}
 			
+			if errResult == "" {
+				errResult = "Error parsing tool parameters"
+			}
+
 			fmt.Println(errResult)
 			if len(toolCall.Function.Arguments) > 0 {
 				argLen := len(toolCall.Function.Arguments)
@@ -917,54 +930,9 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 
 		// Prepare tool display header
 		toolDisplay := fmt.Sprintf("🔧 %s%s%s", types.ColorCyan, toolCall.Function.Name, types.ColorReset)
-		switch toolCall.Function.Name {
-		case "read_file", "preview_edit", "write_file":
-			if path, exists := params["path"]; exists {
-				absPath := fmt.Sprintf("%v", path)
-				relPath, err := filepath.Rel(".", absPath)
-				if err == nil {
-					toolDisplay += fmt.Sprintf(" <%s>", relPath)
-				} else {
-					toolDisplay += fmt.Sprintf(" <%s>", absPath)
-				}
-			}
-		case "edit_file":
-			var path string
-			if filePath, exists := params["filePath"]; exists {
-				path = fmt.Sprintf("%v", filePath)
-			} else if oldPath, exists := params["path"]; exists {
-				path = fmt.Sprintf("%v", oldPath)
-			}
-			relPath, err := filepath.Rel(".", path)
-			if err == nil {
-				path = relPath
-			}
-			if oldString, hasOld := params["oldString"]; hasOld && oldString != "" {
-				toolDisplay += fmt.Sprintf(" 🚀 %s [INCREMENTAL]", path)
-			} else if _, hasNewString := params["newString"]; hasNewString {
-				toolDisplay += fmt.Sprintf(" 🚀 %s [NEW FILE]", path)
-			} else {
-				toolDisplay += fmt.Sprintf(" 📄 %s [FULL REPLACEMENT]", path)
-			}
-		case "list_files":
-			if path, exists := params["path"]; exists {
-				absPath := fmt.Sprintf("%v", path)
-				relPath, err := filepath.Rel(".", absPath)
-				if err == nil {
-					toolDisplay += fmt.Sprintf(" <%s>", relPath)
-				} else {
-					toolDisplay += fmt.Sprintf(" <%s>", absPath)
-				}
-			}
-		case "bash_command":
-			if command, exists := params["command"]; exists {
-				cmdStr := fmt.Sprintf("%v", command)
-				toolDisplay += fmt.Sprintf(" `%s`", cmdStr)
-			}
-		case "search_code":
-			if pattern, exists := params["pattern"]; exists {
-				toolDisplay += fmt.Sprintf(" \"%v\"", pattern)
-			}
+		displayInfo := toolManager.GetDisplayInfo(toolCall.Function.Name, params)
+		if displayInfo != "" {
+			toolDisplay += displayInfo
 		}
 
 		// Check for long-running and permissions
@@ -1049,23 +1017,43 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 				prompt = "\n❓ Execute this tool? (Y/n/s to skip/Esc to interrupt/b for background): "
 			}
 			playNotificationSound()
-			PrintSafe(prompt)
+			ui.PrintSafe(prompt)
 			
-			response = ReadConfirmation()
+			response = ui.ReadConfirmation()
 			if response == "\r" || response == "\n" {
 				response = "" // Treat Enter as default (yes)
 			}
 			
 			// Echo the choice since raw mode doesn't
 			if response == "" {
-				PrintlnSafe("y")
+				ui.PrintlnSafe("y")
 			} else {
-				PrintlnSafe(response)
+				ui.PrintlnSafe(response)
 			}
 		}
 
 		// executeToolBasedOnResponse already has its own spinner
 		result, shouldContinue := executeToolBasedOnResponse(a, response, toolCall, params, isLongRunning, toolManager)
+
+		// If user interrupted with a new instruction, we MUST provide a response for ALL
+		// remaining tool calls in this turn, or the next API call will fail with a 400 error.
+		if !shouldContinue {
+			// Find this tool call in the list and mark all subsequent ones as skipped
+			found := false
+			for _, tc := range toolCalls {
+				if found {
+					a.Conversation = append(a.Conversation, openai.ChatCompletionMessage{
+						Role:       openai.ChatMessageRoleTool,
+						Content:    "Tool call skipped due to user interruption",
+						ToolCallID: tc.ID,
+					})
+				}
+				if tc.ID == toolCall.ID {
+					found = true
+				}
+			}
+			break
+		}
 
 		// Display tool output to user
 		if result != "" && (response == "" || response == "y" || response == "yes" || response == "b" || response == "background") {
@@ -1128,7 +1116,10 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 		}
 
 		// Add tool result to conversation with truncation safety
-		truncatedResult := TruncateForLLM(result, 32000)
+		truncatedResult := TruncateForLLM(a, result, 8000) // Now strictly 8k max
+		if truncatedResult == "" {
+			truncatedResult = " " // Fallback to space for strict providers
+		}
 		a.Conversation = append(a.Conversation, openai.ChatCompletionMessage{
 			Role:       openai.ChatMessageRoleTool,
 			Content:    truncatedResult,
@@ -1178,7 +1169,7 @@ func executeToolBasedOnResponse(a *types.Agent, response string, toolCall openai
 			result = "Error: Unknown tool"
 		} else {
 			// Start spinner for tool execution
-			spinner := NewSpinner(fmt.Sprintf("Executing %s...", toolCall.Function.Name))
+			spinner := ui.NewSpinner(fmt.Sprintf("Executing %s...", toolCall.Function.Name))
 			spinner.Start()
 
 			var err error
@@ -1239,125 +1230,6 @@ func executeToolBasedOnResponse(a *types.Agent, response string, toolCall openai
 	return result, true
 }
 
-// Spinner represents a thread-safe terminal spinner
-type Spinner struct {
-	mu      sync.Mutex
-	done    chan bool
-	cleared chan bool
-	active  bool
-	message string
-	title   string
-}
-
-// NewSpinner creates a new spinner
-func NewSpinner(message string) *Spinner {
-	return &Spinner{
-		message: message,
-	}
-}
-
-// Start starts the spinner if it's not already running
-func (s *Spinner) Start() {
-	s.mu.Lock()
-	if s.active {
-		s.mu.Unlock()
-		return
-	}
-
-	s.done = make(chan bool)
-	s.cleared = make(chan bool)
-	s.active = true
-	
-	msg := s.message
-	title := s.title
-	s.mu.Unlock()
-
-	// Print first frame and update title immediately
-	go func() {
-		spinnerChars := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-		i := 0
-		
-		// Initial frame
-		if title != "" {
-			PrintfSafe("\033]0;%s\007", title)
-		}
-		if msg != "" {
-			PrintfSafe("\r\033[K%s %s", spinnerChars[0], msg)
-		} else {
-			PrintfSafe("\r\033[K%s", spinnerChars[0])
-		}
-		i++
-
-		ticker := time.NewTicker(100 * time.Millisecond)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-s.done:
-				// Clear the spinner completely
-				PrintSafe("\r\033[K")
-				if s.cleared != nil {
-					s.cleared <- true
-				}
-				return
-			case <-ticker.C:
-				s.mu.Lock()
-				msg := s.message
-				title := s.title
-				s.mu.Unlock()
-
-				// Update window title if provided
-				if title != "" {
-					PrintfSafe("\033]0;%s\007", title)
-				}
-
-				// Update spinner line
-				if msg != "" {
-					PrintfSafe("\r\033[K%s %s", spinnerChars[i%len(spinnerChars)], msg)
-				} else {
-					PrintfSafe("\r\033[K%s", spinnerChars[i%len(spinnerChars)])
-				}
-				i++
-			}
-		}
-	}()
-}
-
-// Stop stops the spinner if it is running
-func (s *Spinner) Stop() {
-	s.mu.Lock()
-	if !s.active {
-		s.mu.Unlock()
-		return
-	}
-	done := s.done
-	cleared := s.cleared
-	s.mu.Unlock()
-
-	done <- true
-	if cleared != nil {
-		<-cleared
-	}
-
-	s.mu.Lock()
-	s.active = false
-	s.mu.Unlock()
-}
-
-// UpdateMessage updates the spinner message
-func (s *Spinner) UpdateMessage(message string) {
-	s.mu.Lock()
-	s.message = message
-	s.mu.Unlock()
-}
-
-// SetTitle updates the window title via the spinner
-func (s *Spinner) SetTitle(title string) {
-	s.mu.Lock()
-	s.title = title
-	s.mu.Unlock()
-}
-
 // streamOutput simulates streaming output for content
 func streamOutput(content string) {
 	// Stream the content in small chunks
@@ -1369,10 +1241,10 @@ func streamOutput(content string) {
 		}
 
 		chunk := content[i:end]
-		PrintSafe(chunk)
+		ui.PrintSafe(chunk)
 
 		// Very small delay
 		time.Sleep(1 * time.Millisecond)
 	}
-	PrintlnSafe() // Ensure newline at end
+	ui.PrintlnSafe() // Ensure newline at end
 }

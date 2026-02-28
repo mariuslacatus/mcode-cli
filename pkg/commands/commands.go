@@ -10,6 +10,7 @@ import (
 	"coding-agent/pkg/agent"
 	"coding-agent/pkg/config"
 	"coding-agent/pkg/conversation"
+	"coding-agent/pkg/llm"
 	"coding-agent/pkg/markdown"
 	"coding-agent/pkg/project"
 	"coding-agent/pkg/types"
@@ -202,7 +203,7 @@ func (h *Handler) switchModel(modelKey string) error {
 	// Update client
 	clientConfig := openai.DefaultConfig(model.APIKey)
 	clientConfig.BaseURL = model.BaseURL
-	h.agent.Client = openai.NewClientWithConfig(clientConfig)
+	h.agent.LLM = llm.NewOpenAIProvider(openai.NewClientWithConfig(clientConfig))
 
 	fmt.Printf("✅ Switched to model: %s\n", modelKey)
 	fmt.Printf("📱 Name: %s\n", model.Name)
@@ -692,7 +693,20 @@ func convertMessages(agentMsgs []openai.ChatCompletionMessage) []conversation.Me
 		if msg.Role == openai.ChatMessageRoleTool {
 			cm.ToolID = msg.ToolCallID
 		}
-		// Note: we might need to handle ToolCalls for Assistant role too if we want full fidelity
+		
+		if len(msg.ToolCalls) > 0 {
+			cm.ToolCalls = make([]conversation.ToolCall, len(msg.ToolCalls))
+			for i, tc := range msg.ToolCalls {
+				cm.ToolCalls[i] = conversation.ToolCall{
+					ID:   tc.ID,
+					Type: string(tc.Type),
+					Function: conversation.FunctionCall{
+						Name:      tc.Function.Name,
+						Arguments: tc.Function.Arguments,
+					},
+				}
+			}
+		}
 		convMsgs = append(convMsgs, cm)
 	}
 	return convMsgs
@@ -708,6 +722,20 @@ func convertMessagesFromConversation(conv *conversation.Conversation) []openai.C
 		}
 		if msg.Role == openai.ChatMessageRoleTool {
 			am.ToolCallID = msg.ToolID
+		}
+
+		if len(msg.ToolCalls) > 0 {
+			am.ToolCalls = make([]openai.ToolCall, len(msg.ToolCalls))
+			for i, tc := range msg.ToolCalls {
+				am.ToolCalls[i] = openai.ToolCall{
+					ID:   tc.ID,
+					Type: openai.ToolType(tc.Type),
+					Function: openai.FunctionCall{
+						Name:      tc.Function.Name,
+						Arguments: tc.Function.Arguments,
+					},
+				}
+			}
 		}
 		agentMsgs = append(agentMsgs, am)
 	}

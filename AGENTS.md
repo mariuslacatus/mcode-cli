@@ -33,11 +33,14 @@ mcode/
 
 ## AI Agent Instructions
 
-### Context Efficiency
-- **Avoid reading large files entirely.**
-- **Use pagination** for large files.
-- **Prefer search over full read.**
-- **Use incremental edits** for targeted modifications.
+### Context Efficiency (CRITICAL MANDATE)
+Context is the most valuable and limited resource. Large contexts significantly slow down local LLMs.
+- **ZERO TOLERANCE for context pollution.** Every token sent to the LLM must be high-signal.
+- **Aggressive Truncation:** Always truncate tool outputs (files, listings, command outputs) to the absolute minimum necessary.
+- **Pagination over Bulk:** Never read large files entirely. Use `offset` and `limit`.
+- **Search over full Read:** Use `search_code` to find specific points of interest before reading.
+- **Incremental Edits:** Prefer `edit_file` (find/replace) over `write_file` (full rewrite) to keep diffs and history small.
+- **History Pruning:** Regularly use `/compact` to summarize long histories into high-signal summaries.
 
 ### Permanent Instructions
 - always use Go best practices for this project
