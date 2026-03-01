@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -31,7 +30,7 @@ func New() *types.Agent {
 	configPath := config.GetConfigPath()
 	cfg, err := config.LoadOrCreateConfig(configPath)
 	if err != nil {
-		fmt.Printf("Warning: Failed to load config, using defaults: %v\n", err)
+		ui.PrintfSafe("Warning: Failed to load config, using defaults: %v\n", err)
 		// Fallback to hardcoded defaults
 		cfg = &types.Config{
 			CurrentModel: "qwen3-coder",
@@ -47,7 +46,7 @@ func New() *types.Agent {
 	// Get current model configuration
 	currentModel, exists := cfg.Models[cfg.CurrentModel]
 	if !exists {
-		fmt.Printf("Warning: Current model '%s' not found, using first available model\n", cfg.CurrentModel)
+		ui.PrintfSafe("Warning: Current model '%s' not found, using first available model\n", cfg.CurrentModel)
 		for _, model := range cfg.Models {
 			currentModel = model
 			break
@@ -139,7 +138,7 @@ func RequestFolderPermission(a *types.Agent, folderPath string) bool {
 	// Normalize the path
 	absPath, err := filepath.Abs(folderPath)
 	if err != nil {
-		fmt.Printf("Error resolving path: %v\n", err)
+		ui.PrintfSafe("Error resolving path: %v\n", err)
 		return false
 	}
 
@@ -148,39 +147,25 @@ func RequestFolderPermission(a *types.Agent, folderPath string) bool {
 		return true
 	}
 
-	fmt.Printf("🔒 Request folder access: %s\n", absPath)
-	fmt.Print("❓ Allow list_files and read_file operations in this folder and all subfolders? (Y/n): ")
+	ui.PrintfSafe("🔒 Request folder access: %s\n", absPath)
+	ui.PrintSafe("❓ Allow list_files and read_file operations in this folder and all subfolders? (Y/n): ")
 
 	// Play notification sound
-	go func() {
-		cmd := exec.Command("osascript", "-e", `tell application "System Events" to get name of first application process whose frontmost is true`)
-		output, err := cmd.Output()
-		if err == nil {
-			frontmostApp := strings.TrimSpace(string(output))
-			isTerminalForeground := strings.Contains(frontmostApp, "Terminal") ||
-				strings.Contains(frontmostApp, "iTerm") ||
-				strings.Contains(frontmostApp, "Alacritty") ||
-				strings.Contains(frontmostApp, "Kitty")
+	playNotificationSound()
 
-			if !isTerminalForeground {
-				soundCmd := exec.Command("afplay", "/System/Library/Sounds/Glass.aiff")
-				soundCmd.Run()
-			}
-		}
-	}()
-
-	fmt.Print("\a") // ASCII bell
-
+	ui.PauseInterruptMonitor()
 	response := ui.ReadConfirmation()
+	ui.ResumeInterruptMonitor()
+	
 	if response == "\r" || response == "\n" {
 		response = ""
 	}
 	
 	// Echo the choice
 	if response == "" {
-		fmt.Println("y")
+		ui.PrintlnSafe("y")
 	} else {
-		fmt.Println(response)
+		ui.PrintlnSafe(response)
 	}
 
 	if response == "" || response == "y" || response == "yes" {
@@ -189,14 +174,14 @@ func RequestFolderPermission(a *types.Agent, folderPath string) bool {
 		// Add to config and save persistently
 		a.Config.ApprovedFolders = append(a.Config.ApprovedFolders, absPath)
 		if err := config.Save(a.ConfigPath, a.Config); err != nil {
-			fmt.Printf("⚠️  Warning: Failed to save folder permission: %v\n", err)
+			ui.PrintfSafe("⚠️  Warning: Failed to save folder permission: %v\n", err)
 		}
 
-		fmt.Printf("✅ Folder access granted: %s (includes all subfolders)\n", absPath)
+		ui.PrintfSafe("✅ Folder access granted: %s (includes all subfolders)\n", absPath)
 		return true
 	}
 
-	fmt.Printf("❌ Folder access denied\n")
+	ui.PrintfSafe("❌ Folder access denied\n")
 	return false
 }
 
@@ -261,7 +246,7 @@ func TrimContext(a *types.Agent, messages []openai.ChatCompletionMessage) []open
 		currentTokens += msgTokens
 	}
 
-	fmt.Printf("📉 Context trimmed: %d → %d messages (%d tokens history)\n", len(messages), len(systemMessages)+len(trimmed), currentTokens)
+	ui.PrintfSafe("📉 Context trimmed: %d → %d messages (%d tokens history)\n", len(messages), len(systemMessages)+len(trimmed), currentTokens)
 	return append(systemMessages, trimmed...)
 }
 
@@ -271,7 +256,7 @@ func CompactContext(a *types.Agent) error {
 		return fmt.Errorf("conversation too short to compact")
 	}
 
-	fmt.Printf("\n🗜️  Compacting conversation context... please wait\n")
+	ui.PrintfSafe("\n🗜️  Compacting conversation context... please wait\n")
 
 	// Identify what to keep and what to summarize
 	// Keep system message
@@ -344,7 +329,7 @@ func CompactContext(a *types.Agent) error {
 	}
 
 	var summaryBuilder strings.Builder
-	fmt.Print(types.ColorCyan) // Use cyan for summary generation
+	ui.PrintSafe(types.ColorCyan) // Use cyan for summary generation
 
 	for response := range streamChan {
 		if response.Error != nil {
@@ -354,13 +339,13 @@ func CompactContext(a *types.Agent) error {
 
 		if response.Content != "" {
 			spinner.Stop()
-			fmt.Print(response.Content)
+			ui.PrintSafe(response.Content)
 			summaryBuilder.WriteString(response.Content)
 		}
 	}
 
-	fmt.Print(types.ColorReset) // Reset color
-	fmt.Println()               // Newline after summary
+	ui.PrintSafe(types.ColorReset) // Reset color
+	ui.PrintlnSafe()               // Newline after summary
 
 	summaryContent := summaryBuilder.String()
 
@@ -381,7 +366,7 @@ func CompactContext(a *types.Agent) error {
 	newTokens := tokens.CountMessagesTokens(currentModel.Name, newHistory)
 
 	// Print clear success message
-	fmt.Printf("✅ Context compacted: %d → %d messages (%d tokens)\n", oldLen, len(a.Conversation), newTokens)
+	ui.PrintfSafe("✅ Context compacted: %d → %d messages (%d tokens)\n", oldLen, len(a.Conversation), newTokens)
 
 	// Force update status display
 	UpdateStatusDisplay(a)
@@ -467,7 +452,16 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 
 	renderer, _ := markdown.NewNoMarginTermRenderer()
 
+	// Start interrupt monitor for the entire chat session (generation + tool execution)
+	sessionCtx, cancelSession := ui.StartInterruptMonitor(ctx)
+	defer cancelSession()
+
 	for {
+		// Check for session cancellation
+		if sessionCtx.Err() != nil {
+			return ui.ErrInterrupted
+		}
+
 		// Update status display before generating
 		UpdateStatusDisplay(a)
 
@@ -498,11 +492,11 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 		if currentTokens > threshold {
 			// Temporarily stop thinking spinner to show compaction progress
 			spinner.Stop()
-			fmt.Printf("\n⚠️  Context threshold reached (%d/%d tokens). Auto-compacting...\n", currentTokens, currentModel.MaxTokens)
+			ui.PrintfSafe("\n⚠️  Context threshold reached (%d/%d tokens). Auto-compacting...\n", currentTokens, currentModel.MaxTokens)
 			err := CompactContext(a)
 
 			if err != nil {
-				fmt.Printf("Warning: Auto-compaction failed: %v\n", err)
+				ui.PrintfSafe("Warning: Auto-compaction failed: %v\n", err)
 			} else {
 				messages = a.Conversation
 			}
@@ -535,18 +529,18 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 		}
 
 		// Create streaming request
-		// Start interrupt monitor for streaming phase
-		streamCtx, cancelStream := ui.StartInterruptMonitor(ctx)
-		streamChan, err := a.LLM.CreateStream(streamCtx, req)
+		streamChan, err := a.LLM.CreateStream(sessionCtx, req)
 		if err != nil {
-			cancelStream() // Stop monitor on error
+			if sessionCtx.Err() != nil {
+				return ui.ErrInterrupted
+			}
 			spinner.Stop()
 			errStr := err.Error()
 			if strings.Contains(errStr, "tool call") || strings.Contains(errStr, "Failed to parse") ||
 				strings.Contains(errStr, "Unexpected end") || strings.Contains(errStr, "context") ||
 				strings.Contains(errStr, "too long") || strings.Contains(errStr, "maximum") {
 
-				fmt.Printf("\n⚠️  Request failed: %v\n", err)
+				ui.PrintfSafe("\n⚠️  Request failed: %v\n", err)
 
 				if strings.Contains(errStr, "context") || strings.Contains(errStr, "too long") ||
 					strings.Contains(errStr, "maximum") || a.LastTokenUsage != nil && a.LastTokenUsage.PromptTokens > 6000 {
@@ -555,7 +549,7 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 					matches := re.FindStringSubmatch(errStr)
 					if len(matches) > 1 {
 						if limit, err := strconv.Atoi(matches[1]); err == nil {
-							fmt.Printf("💡 Detected model context limit: %d tokens\n", limit)
+							ui.PrintfSafe("💡 Detected model context limit: %d tokens\n", limit)
 							currentModel.MaxTokens = limit
 							if model, ok := a.Config.Models[a.Config.CurrentModel]; ok {
 								model.MaxTokens = limit
@@ -565,9 +559,9 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 						}
 					}
 
-					fmt.Println("💡 Context window overflow. Auto-compacting and retrying...")
+					ui.PrintlnSafe("💡 Context window overflow. Auto-compacting and retrying...")
 					if err := CompactContext(a); err != nil {
-						fmt.Println("⚠️  Compaction failed, falling back to simple trimming...")
+						ui.PrintlnSafe("⚠️  Compaction failed, falling back to simple trimming...")
 						messages = TrimContext(a, a.Conversation)
 						a.Conversation = messages
 					} else {
@@ -581,16 +575,17 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 					MaxTokens: 2000,
 				}
 
-				fmt.Println("🔄 Retrying with simplified request...")
+				ui.PrintlnSafe("🔄 Retrying with simplified request...")
 				spinner.Start()
 
 				// Monitor interrupt during fallback
-				retryCtx, cancelRetry := ui.StartInterruptMonitor(ctx)
-				resp, err := a.LLM.CreateCompletion(retryCtx, reqFallback)
-				cancelRetry()
+				resp, err := a.LLM.CreateCompletion(sessionCtx, reqFallback)
 				spinner.Stop()
 
 				if err != nil {
+					if sessionCtx.Err() != nil {
+						return ui.ErrInterrupted
+					}
 					return fmt.Errorf("error calling API (even after fallback): %v", err)
 				}
 
@@ -610,7 +605,7 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 
 				if len(resp.ToolCalls) > 0 {
 					tokenStats := fmt.Sprintf("(%d ctx | %d gen)", a.LastTokenUsage.PromptTokens, a.LastTokenUsage.CompletionTokens)
-					if err := handleToolCalls(a, resp.ToolCalls, toolManager, tokenStats, resp.FinishReason == "length"); err != nil {
+					if err := handleToolCalls(sessionCtx, a, resp.ToolCalls, toolManager, tokenStats, resp.FinishReason == "length"); err != nil {
 						return err
 					}
 				} else {
@@ -675,12 +670,8 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 		for response := range streamChan {
 			if response.Error != nil {
 				spinner.Stop()
-				isCanceled := streamCtx.Err() == context.Canceled
-				cancelStream() 
-				
-				if isCanceled {
-					fmt.Println("\n❌ Generation interrupted by user")
-					return nil
+				if sessionCtx.Err() != nil {
+					return ui.ErrInterrupted
 				}
 				return fmt.Errorf("error receiving stream: %v", response.Error)
 			}
@@ -765,7 +756,6 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 				}
 			}
 		}
-		cancelStream()
 
 		// Final check for tool call validity - ensure every tool call has an ID and type
 		validToolCalls := make([]openai.ToolCall, 0)
@@ -829,7 +819,7 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 			if a.LastTokenUsage != nil {
 				tokenStats = fmt.Sprintf("(%d ctx | %d gen)", a.LastTokenUsage.PromptTokens, a.LastTokenUsage.CompletionTokens)
 			}
-			if err := handleToolCalls(a, toolCalls, toolManager, tokenStats, finishReason == "length"); err != nil {
+			if err := handleToolCalls(sessionCtx, a, toolCalls, toolManager, tokenStats, finishReason == "length"); err != nil {
 				return err
 			}
 		} else {
@@ -846,7 +836,7 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 		totalSessionTokens := a.TotalTokensUsed
 
 		if contextTokens > 0 {
-			fmt.Printf("%s[Context: %d tokens | Response: %d tokens | Session: %d tokens]%s\n",
+			ui.PrintfSafe("%s[Context: %d tokens | Response: %d tokens | Session: %d tokens]%s\n",
 				types.ColorBlue, contextTokens, responseTokens, totalSessionTokens, types.ColorReset)
 		}
 
@@ -884,8 +874,13 @@ func TruncateForLLM(a *types.Agent, s string, maxChars int) string {
 }
 
 // handleToolCalls processes tool calls from the AI model
-func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *tools.Manager, tokenStats string, truncated bool) error {
+func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.ToolCall, toolManager *tools.Manager, tokenStats string, truncated bool) error {
 	for _, toolCall := range toolCalls {
+		// Check for context cancellation
+		if ctx.Err() != nil {
+			return ui.ErrInterrupted
+		}
+
 		// Start a spinner while we process this tool call (parse, check permissions, get preview)
 		msg := fmt.Sprintf("Processing %s", toolCall.Function.Name)
 		if tokenStats != "" {
@@ -1000,10 +995,10 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 
 		// NOW we are ready to show everything and prompt the user
 		spinner.Stop()
-		fmt.Printf("\n%s\n", toolDisplay)
+		ui.PrintfSafe("\n%s\n", toolDisplay)
 
 		if preview != "" {
-			fmt.Printf("\n%s--- PREVIEW ---%s\n%s\n%s--- END PREVIEW ---%s\n",
+			ui.PrintfSafe("\n%s--- PREVIEW ---%s\n%s\n%s--- END PREVIEW ---%s\n",
 				types.ColorBlue, types.ColorReset, preview, types.ColorBlue, types.ColorReset)
 		}
 
@@ -1011,15 +1006,18 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 		if shouldAutoExecute {
 			response = "y"
 		} else {
-			prompt := "\n❓ Execute this tool? (Y/n/s to skip/Esc to interrupt): "
+			prompt := "\n❓ Execute this tool? (Y/n/s to skip/Esc to cancel): "
 			if isLongRunning {
-				fmt.Printf("%s⚠️  This looks like a long-running command!%s\n", types.ColorYellow, types.ColorReset)
-				prompt = "\n❓ Execute this tool? (Y/n/s to skip/Esc to interrupt/b for background): "
+				ui.PrintfSafe("%s⚠️  This looks like a long-running command!%s\n", types.ColorYellow, types.ColorReset)
+				prompt = "\n❓ Execute this tool? (Y/n/s to skip/Esc to cancel/b for background): "
 			}
 			playNotificationSound()
 			ui.PrintSafe(prompt)
 			
+			ui.PauseInterruptMonitor()
 			response = ui.ReadConfirmation()
+			ui.ResumeInterruptMonitor()
+			
 			if response == "\r" || response == "\n" {
 				response = "" // Treat Enter as default (yes)
 			}
@@ -1027,16 +1025,36 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 			// Echo the choice since raw mode doesn't
 			if response == "" {
 				ui.PrintlnSafe("y")
+			} else if response == "i" {
+				// Escape or Ctrl+C from ReadConfirmation
+				ui.PrintlnSafe("cancel")
 			} else {
 				ui.PrintlnSafe(response)
 			}
 		}
 
 		// executeToolBasedOnResponse already has its own spinner
-		result, shouldContinue := executeToolBasedOnResponse(a, response, toolCall, params, isLongRunning, toolManager)
+		result, shouldContinue, err := executeToolBasedOnResponse(ctx, a, response, toolCall, params, isLongRunning, toolManager)
 
-		// If user interrupted with a new instruction, we MUST provide a response for ALL
-		// remaining tool calls in this turn, or the next API call will fail with a 400 error.
+		// If user interrupted or error occurred
+		if err != nil {
+			// Find this tool call in the list and mark all subsequent ones as skipped
+			found := false
+			for _, tc := range toolCalls {
+				if found {
+					a.Conversation = append(a.Conversation, openai.ChatCompletionMessage{
+						Role:       openai.ChatMessageRoleTool,
+						Content:    "Tool call skipped due to user interruption",
+						ToolCallID: tc.ID,
+					})
+				}
+				if tc.ID == toolCall.ID {
+					found = true
+				}
+			}
+			return err
+		}
+
 		if !shouldContinue {
 			// Find this tool call in the list and mark all subsequent ones as skipped
 			found := false
@@ -1059,17 +1077,17 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 		if result != "" && (response == "" || response == "y" || response == "yes" || response == "b" || response == "background") {
 			// Always show errors in red
 			if strings.HasPrefix(result, "Error:") {
-				fmt.Printf("\n%s> %s%s\n", types.ColorRed, result, types.ColorReset)
+				ui.PrintfSafe("\n%s> %s%s\n", types.ColorRed, result, types.ColorReset)
 			} else if toolCall.Function.Name == "edit_file" || toolCall.Function.Name == "write_file" {
-				fmt.Println() // Add blank line after tool call
+				ui.PrintlnSafe() // Add blank line after tool call
 				// Only stream diff/output if it wasn't already shown in preview
 				if preview == "" {
 					streamOutput(result)
 				} else {
-					fmt.Printf("✅ %s applied successfully\n\n", toolCall.Function.Name)
+					ui.PrintfSafe("✅ %s applied successfully\n\n", toolCall.Function.Name)
 				}
 			} else if toolCall.Function.Name == "read_file" {
-				fmt.Println() // Add blank line after tool call
+				ui.PrintlnSafe() // Add blank line after tool call
 				offset := 0
 				if v, ok := params["offset"].(float64); ok {
 					offset = int(v)
@@ -1090,27 +1108,27 @@ func handleToolCalls(a *types.Agent, toolCalls []openai.ToolCall, toolManager *t
 				}
 
 				if lineCount > 0 {
-					fmt.Printf("%s> Read lines %d-%d (%d lines)%s\n",
+					ui.PrintfSafe("%s> Read lines %d-%d (%d lines)%s\n",
 						types.ColorCyan, offset, offset+lineCount-1, lineCount, types.ColorReset)
 				} else {
-					fmt.Printf("%s> Read 0 lines (empty or at end of file)%s\n", types.ColorCyan, types.ColorReset)
+					ui.PrintfSafe("%s> Read 0 lines (empty or at end of file)%s\n", types.ColorCyan, types.ColorReset)
 				}
 			} else if toolCall.Function.Name == "search_code" {
-				fmt.Println() // Add blank line after tool call
+				ui.PrintlnSafe() // Add blank line after tool call
 				lineCount := strings.Count(result, "\n")
-				fmt.Printf("%s> Found %d matches%s\n", types.ColorCyan, lineCount, types.ColorReset)
+				ui.PrintfSafe("%s> Found %d matches%s\n", types.ColorCyan, lineCount, types.ColorReset)
 			} else if toolCall.Function.Name == "list_files" {
-				fmt.Println() // Add blank line after tool call
+				ui.PrintlnSafe() // Add blank line after tool call
 				lineCount := strings.Count(result, "\n")
-				fmt.Printf("%s> Listed %d items%s\n", types.ColorCyan, lineCount, types.ColorReset)
+				ui.PrintfSafe("%s> Listed %d items%s\n", types.ColorCyan, lineCount, types.ColorReset)
 			} else if toolCall.Function.Name != "read_file" && toolCall.Function.Name != "list_files" && toolCall.Function.Name != "bash_command" {
-				fmt.Println() // Add blank line after tool call
+				ui.PrintlnSafe() // Add blank line after tool call
 				// Generic output display (skip read_file, list_files and bash_command to avoid clutter/duplication)
-				fmt.Printf("%s> Tool Output:%s\n", types.ColorCyan, types.ColorReset)
+				ui.PrintfSafe("%s> Tool Output:%s\n", types.ColorCyan, types.ColorReset)
 				if len(result) > 2000 {
-					fmt.Println(result[:2000] + "... (truncated)")
+					ui.PrintlnSafe(result[:2000] + "... (truncated)")
 				} else {
-					fmt.Println(result)
+					ui.PrintlnSafe(result)
 				}
 			}
 		}
@@ -1158,8 +1176,12 @@ func playNotificationSound() {
 }
 
 // executeToolBasedOnResponse executes a tool based on user response
-func executeToolBasedOnResponse(a *types.Agent, response string, toolCall openai.ToolCall, params map[string]interface{}, isLongRunning bool, toolManager *tools.Manager) (string, bool) {
+func executeToolBasedOnResponse(ctx context.Context, a *types.Agent, response string, toolCall openai.ToolCall, params map[string]interface{}, isLongRunning bool, toolManager *tools.Manager) (string, bool, error) {
 	var result string
+
+	if response == "i" {
+		return "", false, ui.ErrInterrupted
+	}
 
 	if response == "" || response == "y" || response == "yes" {
 		// Execute the tool
@@ -1172,11 +1194,17 @@ func executeToolBasedOnResponse(a *types.Agent, response string, toolCall openai
 			spinner := ui.NewSpinner(fmt.Sprintf("Executing %s...", toolCall.Function.Name))
 			spinner.Start()
 
+			// Tool execution doesn't support context yet, so we just run it
+			// and check context afterward
 			var err error
 			result, err = toolFunc(params)
 
 			// Stop spinner
 			spinner.Stop()
+
+			if ctx.Err() != nil {
+				return "", false, ui.ErrInterrupted
+			}
 
 			if err != nil {
 				result = fmt.Sprintf("Error: %v", err)
@@ -1194,40 +1222,12 @@ func executeToolBasedOnResponse(a *types.Agent, response string, toolCall openai
 			result = "Background execution only available for long-running commands"
 			fmt.Printf("⚠️  Background execution only available for long-running commands\n")
 		}
-	} else if response == "i" || response == "interrupt" {
-		fmt.Print("\n💬 What would you like me to do instead? ")
-		interruptScanner := bufio.NewScanner(os.Stdin)
-		interruptScanner.Scan()
-		userInstruction := strings.TrimSpace(interruptScanner.Text())
-		if userInstruction != "" {
-			fmt.Printf("🔄 Interrupting with new instruction: %s\n", userInstruction)
-			result = fmt.Sprintf("Tool execution interrupted by user. New instruction: %s", userInstruction)
-
-			// Add the interrupt result to conversation
-			a.Conversation = append(a.Conversation, openai.ChatCompletionMessage{
-				Role:       openai.ChatMessageRoleTool,
-				Content:    result,
-				ToolCallID: toolCall.ID,
-			})
-
-			// Add the new user message and continue the conversation
-			a.Conversation = append(a.Conversation, openai.ChatCompletionMessage{
-				Role:    openai.ChatMessageRoleUser,
-				Content: userInstruction,
-			})
-
-			// Return early to skip adding the result again
-			return result, false
-		} else {
-			result = "Tool execution interrupted but no alternative instruction provided"
-			fmt.Printf("⚠️  No alternative instruction provided\n")
-		}
 	} else {
 		result = "Tool execution denied by user"
 		fmt.Printf("❌ Tool execution denied\n")
 	}
 
-	return result, true
+	return result, true, nil
 }
 
 // streamOutput simulates streaming output for content

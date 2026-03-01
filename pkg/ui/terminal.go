@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
@@ -14,10 +15,24 @@ import (
 
 var (
 	isRawMode atomic.Bool
+	isPaused  atomic.Bool
 	rawModeMu sync.Mutex
 	oldState  *term.State
 	outputMu  sync.Mutex
+	
+	// ErrInterrupted is returned when the user presses Escape or Ctrl+C
+	ErrInterrupted = fmt.Errorf("interrupted by user")
 )
+
+// PauseInterruptMonitor temporarily stops the monitor from reading stdin
+func PauseInterruptMonitor() {
+	isPaused.Store(true)
+}
+
+// ResumeInterruptMonitor resumes reading from stdin
+func ResumeInterruptMonitor() {
+	isPaused.Store(false)
+}
 
 // StartInterruptMonitor puts terminal in raw mode and cancels context on Escape.
 // Returns a derived context and a restore function.
@@ -36,7 +51,12 @@ func StartInterruptMonitor(ctx context.Context) (context.Context, func()) {
 	}
 	rawModeMu.Unlock()
 
+	// Use a wait group to ensure the goroutine has finished before restoring
+	var wg sync.WaitGroup
+	wg.Add(1)
+
 	go func() {
+		defer wg.Done()
 		defer cancel()
 		
 		buf := make([]byte, 1)
@@ -45,18 +65,28 @@ func StartInterruptMonitor(ctx context.Context) (context.Context, func()) {
 			case <-ctx.Done():
 				return
 			default:
+				if isPaused.Load() {
+					time.Sleep(50 * time.Millisecond)
+					continue
+				}
+
 				// Check if data is available to read using select
-				if inputAvailable(fd) {
+				if inputAvailableShort(fd) {
 					n, err := os.Stdin.Read(buf)
 					if err != nil {
 						continue
 					}
 					if n > 0 {
 						if buf[0] == 27 { // Escape
-							if inputAvailableShort(fd) {
-								continue
+							// If it's just Escape (no following chars in short time), it's an interrupt
+							if !inputAvailableShort(fd) {
+								return
 							}
-							return // Standalone Escape
+							// Otherwise, it's an escape sequence, consume it
+							for inputAvailableShort(fd) {
+								os.Stdin.Read(buf)
+							}
+							continue
 						}
 						// Also handle Ctrl+C (ETX)
 						if buf[0] == 3 {
@@ -64,12 +94,15 @@ func StartInterruptMonitor(ctx context.Context) (context.Context, func()) {
 						}
 					}
 				}
+				// Small sleep to prevent busy loop but keep it responsive
+				time.Sleep(10 * time.Millisecond)
 			}
 		}
 	}()
 
 	return ctx, func() {
 		cancel()
+		wg.Wait()
 		
 		rawModeMu.Lock()
 		defer rawModeMu.Unlock()

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"coding-agent/pkg/commands"
 	"coding-agent/pkg/project"
 	"coding-agent/pkg/types"
+	"coding-agent/pkg/ui"
 
 	"golang.org/x/term"
 
@@ -164,7 +166,11 @@ func main() {
 
 		// Regular chat message
 		if err := agent.Chat(ag, ctx, input); err != nil {
-			fmt.Printf("Error: %v\n", err)
+			if errors.Is(err, ui.ErrInterrupted) {
+				fmt.Println("\n❌ Operation cancelled")
+			} else {
+				fmt.Printf("Error: %v\n", err)
+			}
 		}
 	}
 }
