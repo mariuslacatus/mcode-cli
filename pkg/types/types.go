@@ -7,9 +7,9 @@ import (
 
 // Config represents the application configuration
 type Config struct {
-	CurrentModel    string            `json:"current_model"`
-	Models          map[string]Model  `json:"models"`
-	ApprovedFolders []string          `json:"approved_folders"`
+	CurrentModel    string           `json:"current_model"`
+	Models          map[string]Model `json:"models"`
+	ApprovedFolders []string         `json:"approved_folders"`
 }
 
 // Model represents an AI model configuration
@@ -17,14 +17,26 @@ type Model struct {
 	Name                string `json:"name"`
 	BaseURL             string `json:"base_url"`
 	APIKey              string `json:"api_key,omitempty"`
-	MaxTokens           int    `json:"max_tokens,omitempty"`           // Maximum context length in tokens
+	Provider            string `json:"provider,omitempty"`              // e.g., "openai", "gemini"
+	MaxTokens           int    `json:"max_tokens,omitempty"`            // Maximum context length in tokens
 	MaxCompletionTokens int    `json:"max_completion_tokens,omitempty"` // Maximum tokens to generate
+}
+
+// Message represents a conversation message with optional reasoning
+type Message struct {
+	Role             string            `json:"role"`
+	Content          string            `json:"content"`
+	Reasoning        string            `json:"reasoning,omitempty"`
+	ThoughtSignature []byte            `json:"thought_signature,omitempty"`
+	Name             string            `json:"name,omitempty"`
+	ToolCallID       string            `json:"tool_call_id,omitempty"`
+	ToolCalls        []openai.ToolCall `json:"tool_calls,omitempty"`
 }
 
 // Agent represents the AI agent with its state
 type Agent struct {
 	LLM             llm.Provider
-	Conversation    []openai.ChatCompletionMessage
+	Conversation    []Message
 	Tools           map[string]func(map[string]interface{}) (string, error)
 	LastTokenUsage  *openai.Usage
 	TotalTokensUsed int
@@ -36,12 +48,12 @@ type Agent struct {
 
 // ANSI color codes for console output
 const (
-	ColorReset  = "\033[0m"
-	ColorRed    = "\033[31m"
-	ColorGreen  = "\033[32m"
-	ColorYellow = "\033[33m"
-	ColorBlue   = "\033[34m"
-	ColorCyan   = "\033[36m"
-	ColorGray   = "\033[90m"
+	ColorReset   = "\033[0m"
+	ColorRed     = "\033[31m"
+	ColorGreen   = "\033[32m"
+	ColorYellow  = "\033[33m"
+	ColorBlue    = "\033[34m"
+	ColorCyan    = "\033[36m"
+	ColorGray    = "\033[90m"
 	ColorMagenta = "\033[35m"
 )

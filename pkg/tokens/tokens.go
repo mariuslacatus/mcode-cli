@@ -3,8 +3,8 @@ package tokens
 import (
 	"strings"
 
+	"coding-agent/pkg/types"
 	"github.com/pkoukk/tiktoken-go"
-	"github.com/sashabaranov/go-openai"
 )
 
 // CountTokens returns the number of tokens in a string for a given model
@@ -35,7 +35,7 @@ func CountTokens(modelName, text string) int {
 }
 
 // CountMessagesTokens returns the total number of tokens for a list of messages
-func CountMessagesTokens(modelName string, messages []openai.ChatCompletionMessage) int {
+func CountMessagesTokens(modelName string, messages []types.Message) int {
 	var tokensPerMessage int
 	var tokensPerName int
 
@@ -52,12 +52,13 @@ func CountMessagesTokens(modelName string, messages []openai.ChatCompletionMessa
 	for _, message := range messages {
 		numTokens += tokensPerMessage
 		numTokens += CountTokens(modelName, message.Content)
+		numTokens += CountTokens(modelName, message.Reasoning)
 		numTokens += CountTokens(modelName, message.Role)
 		if message.Name != "" {
 			numTokens += tokensPerName
 			numTokens += CountTokens(modelName, message.Name)
 		}
-		
+
 		// Count tool calls tokens
 		if len(message.ToolCalls) > 0 {
 			for _, tc := range message.ToolCalls {
@@ -66,7 +67,7 @@ func CountMessagesTokens(modelName string, messages []openai.ChatCompletionMessa
 			}
 		}
 	}
-	
+
 	numTokens += 3 // every reply is primed with <|start|>assistant<|message|>
 	return numTokens
 }

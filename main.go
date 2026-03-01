@@ -110,7 +110,7 @@ func main() {
 		// Update prompt with model and token count
 		tokens := agent.GetContextTokens(ag)
 		modelName := ag.Config.CurrentModel
-		
+
 		prompt := fmt.Sprintf("[%s] > ", modelName)
 		if tokens > 0 {
 			if tokens >= 1000 {

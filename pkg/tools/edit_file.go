@@ -128,7 +128,7 @@ func (t *EditFileTool) GetDisplayInfo(params map[string]interface{}) string {
 	if err == nil {
 		path = relPath
 	}
-	
+
 	if args.OldString != "" {
 		return fmt.Sprintf(" 🚀 %s [INCREMENTAL]", path)
 	} else if args.NewString != "" {

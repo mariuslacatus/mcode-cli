@@ -70,6 +70,13 @@ func LoadOrCreateConfig(configPath string) (*types.Config, error) {
 				MaxTokens:           128000,
 				MaxCompletionTokens: 16384,
 			},
+			"gemini-thinking": {
+				Name:                "gemini-2.0-flash-thinking-exp-01-21",
+				Provider:            "gemini",
+				APIKey:              "",
+				MaxTokens:           32768,
+				MaxCompletionTokens: 8192,
+			},
 		},
 		ApprovedFolders: []string{},
 	}

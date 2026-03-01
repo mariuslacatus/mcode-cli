@@ -58,7 +58,7 @@ func TestManager(t *testing.T) {
 	if err := mgr.Delete("test-conv-1"); err != nil {
 		t.Errorf("Delete() error = %v", err)
 	}
-	
+
 	_, err = mgr.Load("test-conv-1")
 	if err == nil {
 		t.Error("Load() should have failed after Delete()")

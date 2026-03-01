@@ -39,8 +39,8 @@ func (m *Manager) LoadProjectContext() {
 		// Add AGENTS.md content as system context
 		agentsContent := string(content)
 		if strings.TrimSpace(agentsContent) != "" {
-			systemMsg := openai.ChatCompletionMessage{
-				Role:    "system",
+			systemMsg := types.Message{
+				Role:    openai.ChatMessageRoleSystem,
 				Content: "Project context from AGENTS.md:\n\n" + agentsContent,
 			}
 			m.agent.Conversation = append(m.agent.Conversation, systemMsg)

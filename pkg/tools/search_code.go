@@ -58,7 +58,7 @@ func (t *SearchCodeTool) Execute(params map[string]interface{}) (string, error) 
 	// Use -E for extended regex support (e.g. | operator)
 	cmd := exec.Command("bash", "-c", fmt.Sprintf("grep -rEnI %q %s | head -n 100", args.Pattern, directory))
 	output, _ := cmd.CombinedOutput()
-	
+
 	result := string(output)
 	if result == "" {
 		return fmt.Sprintf("No results found for pattern %q in directory %s", args.Pattern, directory), nil

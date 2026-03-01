@@ -53,10 +53,26 @@ func New() *types.Agent {
 		}
 	}
 
-	// Configure OpenAI client
-	clientConfig := openai.DefaultConfig(currentModel.APIKey)
-	clientConfig.BaseURL = currentModel.BaseURL
-	client := openai.NewClientWithConfig(clientConfig)
+	var provider llm.Provider
+	if currentModel.Provider == "gemini" || strings.Contains(strings.ToLower(currentModel.Name), "gemini") {
+		// Initialize Gemini provider
+		geminiProvider, err := llm.NewGeminiProvider(context.Background(), currentModel.APIKey)
+		if err != nil {
+			ui.PrintfSafe("Error initializing Gemini provider: %v. Falling back to OpenAI provider.\n", err)
+			clientConfig := openai.DefaultConfig(currentModel.APIKey)
+			clientConfig.BaseURL = currentModel.BaseURL
+			client := openai.NewClientWithConfig(clientConfig)
+			provider = llm.NewOpenAIProvider(client)
+		} else {
+			provider = geminiProvider
+		}
+	} else {
+		// Configure OpenAI client
+		clientConfig := openai.DefaultConfig(currentModel.APIKey)
+		clientConfig.BaseURL = currentModel.BaseURL
+		client := openai.NewClientWithConfig(clientConfig)
+		provider = llm.NewOpenAIProvider(client)
+	}
 
 	// Convert approved folders slice to map for faster lookup
 	approvedFolders := make(map[string]bool)
@@ -65,8 +81,8 @@ func New() *types.Agent {
 	}
 
 	agent := &types.Agent{
-		LLM:             llm.NewOpenAIProvider(client),
-		Conversation:    []openai.ChatCompletionMessage{},
+		LLM:             provider,
+		Conversation:    []types.Message{},
 		Tools:           make(map[string]func(map[string]interface{}) (string, error)),
 		Config:          cfg,
 		ConfigPath:      configPath,
@@ -89,14 +105,58 @@ func GetContextTokens(a *types.Agent) int {
 	if a.LastTokenUsage != nil && a.LastTokenUsage.PromptTokens > 0 {
 		return a.LastTokenUsage.PromptTokens
 	}
-	
+
 	// Otherwise estimate using tiktoken
 	modelName := a.Config.CurrentModel
 	if model, ok := a.Config.Models[modelName]; ok {
 		modelName = model.Name
 	}
-	
+
 	return tokens.CountMessagesTokens(modelName, a.Conversation)
+}
+
+func convertToOpenAIMessages(messages []types.Message) []openai.ChatCompletionMessage {
+	var res []openai.ChatCompletionMessage
+	for _, m := range messages {
+		res = append(res, openai.ChatCompletionMessage{
+			Role:       m.Role,
+			Content:    m.Content,
+			Name:       m.Name,
+			ToolCallID: m.ToolCallID,
+			ToolCalls:  m.ToolCalls,
+		})
+	}
+	return res
+}
+
+func convertToTypesMessages(messages []openai.ChatCompletionMessage) []types.Message {
+	var res []types.Message
+	for _, m := range messages {
+		res = append(res, types.Message{
+			Role:       m.Role,
+			Content:    m.Content,
+			Name:       m.Name,
+			ToolCallID: m.ToolCallID,
+			ToolCalls:  m.ToolCalls,
+		})
+	}
+	return res
+}
+
+func convertToLLMMessages(messages []types.Message) []llm.Message {
+	var res []llm.Message
+	for _, m := range messages {
+		res = append(res, llm.Message{
+			Role:             m.Role,
+			Content:          m.Content,
+			Reasoning:        m.Reasoning,
+			ThoughtSignature: m.ThoughtSignature,
+			Name:             m.Name,
+			ToolCallID:       m.ToolCallID,
+			ToolCalls:        m.ToolCalls,
+		})
+	}
+	return res
 }
 
 // GetTotalTokensUsed returns the total tokens used in the session
@@ -156,11 +216,11 @@ func RequestFolderPermission(a *types.Agent, folderPath string) bool {
 	ui.PauseInterruptMonitor()
 	response := ui.ReadConfirmation()
 	ui.ResumeInterruptMonitor()
-	
+
 	if response == "\r" || response == "\n" {
 		response = ""
 	}
-	
+
 	// Echo the choice
 	if response == "" {
 		ui.PrintlnSafe("y")
@@ -187,7 +247,7 @@ func RequestFolderPermission(a *types.Agent, folderPath string) bool {
 
 // TrimContext reduces conversation history to stay within a token budget.
 // It prioritizes keeping system messages and the most recent interactions.
-func TrimContext(a *types.Agent, messages []openai.ChatCompletionMessage) []openai.ChatCompletionMessage {
+func TrimContext(a *types.Agent, messages []types.Message) []types.Message {
 	if len(messages) <= 3 {
 		return messages
 	}
@@ -199,30 +259,19 @@ func TrimContext(a *types.Agent, messages []openai.ChatCompletionMessage) []open
 		currentModel = types.Model{Name: modelName, MaxTokens: 8000}
 	}
 
-	// Budget Calculation:
-	// We want to reserve space for:
-	// 1. The System Prompt (~20% or at least 2k)
-	// 2. The Current Task/User Message (~20%)
-	// 3. The Expected Completion (~20% or MaxCompletionTokens)
-	// 4. The History (The remainder, but capped for speed)
-	
 	totalLimit := currentModel.MaxTokens
 	if totalLimit <= 0 {
 		totalLimit = 8000 // Default fallback
 	}
 
-	// Budget is 50% of total context. 
-	// This allows history to scale with the model (e.g. 64k history for 128k model)
-	// while still leaving 50% for system prompts, current code, and the output.
 	tokenBudget := int(float64(totalLimit) * 0.5)
-	
-	// Sane upper bound for memory safety (e.g. 100k tokens of history is huge)
+
 	if tokenBudget > 100000 {
 		tokenBudget = 100000
 	}
-	
-	var systemMessages []openai.ChatCompletionMessage
-	var otherMessages []openai.ChatCompletionMessage
+
+	var systemMessages []types.Message
+	var otherMessages []types.Message
 
 	for _, msg := range messages {
 		if msg.Role == openai.ChatMessageRoleSystem {
@@ -232,17 +281,15 @@ func TrimContext(a *types.Agent, messages []openai.ChatCompletionMessage) []open
 		}
 	}
 
-	// Keep messages from the end until we hit the budget
-	var trimmed []openai.ChatCompletionMessage
+	var trimmed []types.Message
 	currentTokens := 0
-	
+
 	for i := len(otherMessages) - 1; i >= 0; i-- {
-		msgTokens := tokens.CountMessagesTokens(currentModel.Name, []openai.ChatCompletionMessage{otherMessages[i]})
-		// Always keep at least 2 recent interactions (4 messages: 2 user, 2 assistant/tool)
+		msgTokens := tokens.CountMessagesTokens(currentModel.Name, []types.Message{otherMessages[i]})
 		if currentTokens+msgTokens > tokenBudget && len(trimmed) >= 4 {
-			break 
+			break
 		}
-		trimmed = append([]openai.ChatCompletionMessage{otherMessages[i]}, trimmed...)
+		trimmed = append([]types.Message{otherMessages[i]}, trimmed...)
 		currentTokens += msgTokens
 	}
 
@@ -258,15 +305,10 @@ func CompactContext(a *types.Agent) error {
 
 	ui.PrintfSafe("\n🗜️  Compacting conversation context... please wait\n")
 
-	// Identify what to keep and what to summarize
-	// Keep system message
-	var systemMessages []openai.ChatCompletionMessage
-	// Keep last few messages to maintain immediate flow
-	var recentMessages []openai.ChatCompletionMessage
-	// Messages to summarize
-	var toSummarize []openai.ChatCompletionMessage
+	var systemMessages []types.Message
+	var recentMessages []types.Message
+	var toSummarize []types.Message
 
-	// Separate messages
 	conversationLen := len(a.Conversation)
 	keepRecent := 4
 
@@ -276,7 +318,6 @@ func CompactContext(a *types.Agent) error {
 		} else if i >= conversationLen-keepRecent {
 			recentMessages = append(recentMessages, msg)
 		} else {
-			// Don't summarize other system messages if they exist in middle (rare but possible)
 			if msg.Role != openai.ChatMessageRoleSystem {
 				toSummarize = append(toSummarize, msg)
 			}
@@ -287,38 +328,32 @@ func CompactContext(a *types.Agent) error {
 		return fmt.Errorf("no messages to compact")
 	}
 
-	// Create a summarization prompt
 	summaryPrompt := "Please provide a detailed, technical summary of the above conversation. \n" +
 		"Focus on preserving context relevant to the current coding goal. \n" +
 		"You may discard code snippets or details that are no longer relevant to the current task. \n" +
 		"Preserve key technical decisions and any active constraints or instructions."
 
-	// Create a temporary conversation for the summarizer model
-	summaryConv := append([]openai.ChatCompletionMessage{}, toSummarize...)
-	summaryConv = append(summaryConv, openai.ChatCompletionMessage{
+	summaryConv := append([]types.Message{}, toSummarize...)
+	summaryConv = append(summaryConv, types.Message{
 		Role:    openai.ChatMessageRoleUser,
 		Content: summaryPrompt,
 	})
 
-	// Use the current model for summarization
-	// Get current model configuration
 	currentModel, exists := a.Config.Models[a.Config.CurrentModel]
 	if !exists {
-		// Fallback to finding any model
 		for _, m := range a.Config.Models {
 			currentModel = m
 			break
 		}
 	}
 
-	req := openai.ChatCompletionRequest{
+	req := llm.Request{
 		Model:     currentModel.Name,
-		Messages:  summaryConv,
-		MaxTokens: 4000, // Allow decent size for detailed summary
+		Messages:  convertToLLMMessages(summaryConv),
+		MaxTokens: 4000,
 		Stream:    true,
 	}
 
-	// Execute request with streaming
 	spinner := ui.NewSpinner("Compacting context...")
 	spinner.Start()
 
@@ -329,7 +364,7 @@ func CompactContext(a *types.Agent) error {
 	}
 
 	var summaryBuilder strings.Builder
-	ui.PrintSafe(types.ColorCyan) // Use cyan for summary generation
+	ui.PrintSafe(types.ColorCyan)
 
 	for response := range streamChan {
 		if response.Error != nil {
@@ -344,31 +379,26 @@ func CompactContext(a *types.Agent) error {
 		}
 	}
 
-	ui.PrintSafe(types.ColorReset) // Reset color
-	ui.PrintlnSafe()               // Newline after summary
+	ui.PrintSafe(types.ColorReset)
+	ui.PrintlnSafe()
 
 	summaryContent := summaryBuilder.String()
 
-	// Construct new conversation history
-	var newHistory []openai.ChatCompletionMessage
+	var newHistory []types.Message
 	newHistory = append(newHistory, systemMessages...)
-	newHistory = append(newHistory, openai.ChatCompletionMessage{
+	newHistory = append(newHistory, types.Message{
 		Role:    openai.ChatMessageRoleSystem,
 		Content: fmt.Sprintf("For context, here is a detailed summary of the previous conversation history:\n\n%s", summaryContent),
 	})
 	newHistory = append(newHistory, recentMessages...)
 
-	// Update agent state
 	oldLen := len(a.Conversation)
 	a.Conversation = newHistory
 
-	// Calculate new token estimate using tiktoken
 	newTokens := tokens.CountMessagesTokens(currentModel.Name, newHistory)
 
-	// Print clear success message
 	ui.PrintfSafe("✅ Context compacted: %d → %d messages (%d tokens)\n", oldLen, len(a.Conversation), newTokens)
 
-	// Force update status display
 	UpdateStatusDisplay(a)
 
 	return nil
@@ -387,8 +417,6 @@ func UpdateStatusDisplay(a *types.Agent) {
 // InitConversation initializes the conversation with system prompts
 func InitConversation(a *types.Agent) {
 	projectManager := project.NewManager(a)
-	
-	// Load AGENTS.md content for context
 	agentsContent := projectManager.LoadAgentsMD()
 
 	basePrompt := `You are a helpful coding agent. You have access to tools to help the user with their coding tasks. 
@@ -411,14 +439,12 @@ Assistant: "main.go is 1200 lines (only 300 read). I'll now read the next 300 li
 
 Follow these principles to stay within the context window and maintain high performance. Always be clear about your intent and rationale.`
 
-	// Add AGENTS.md context if available
 	systemPrompt := basePrompt
 	if agentsContent != "" {
 		systemPrompt += fmt.Sprintf("\n\n--- PROJECT CONTEXT (AGENTS.md) ---\n%s\n--- END PROJECT CONTEXT ---\n\nIMPORTANT: Pay special attention to any 'Permanent Instructions' in the project context above and follow them consistently.", agentsContent)
 	}
 
-	// Always clear and start with this system prompt as message 0
-	a.Conversation = []openai.ChatCompletionMessage{
+	a.Conversation = []types.Message{
 		{
 			Role:    openai.ChatMessageRoleSystem,
 			Content: systemPrompt,
@@ -431,50 +457,41 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 	toolManager := tools.NewManager(a)
 	toolManager.RegisterTools()
 
-	// Add system message if this is the first message or it's missing
 	if len(a.Conversation) == 0 {
 		InitConversation(a)
 	}
 
-	a.Conversation = append(a.Conversation, openai.ChatCompletionMessage{
+	a.Conversation = append(a.Conversation, types.Message{
 		Role:    openai.ChatMessageRoleUser,
 		Content: message,
 	})
 
-	// Check if user requested compaction via command
 	if strings.TrimSpace(message) == "/compact" {
 		if err := CompactContext(a); err != nil {
 			return err
 		}
-		// Don't continue to LLM after strict command
 		return nil
 	}
 
 	renderer, _ := markdown.NewNoMarginTermRenderer()
 
-	// Start interrupt monitor for the entire chat session (generation + tool execution)
 	sessionCtx, cancelSession := ui.StartInterruptMonitor(ctx)
 	defer cancelSession()
 
 	for {
-		// Check for session cancellation
 		if sessionCtx.Err() != nil {
 			return ui.ErrInterrupted
 		}
 
-		// Update status display before generating
 		UpdateStatusDisplay(a)
 
-		// Get current model name
 		currentModel, exists := a.Config.Models[a.Config.CurrentModel]
 		if !exists {
 			return fmt.Errorf("current model '%s' not found in configuration", a.Config.CurrentModel)
 		}
 
-		// Check if context is getting too large and trim if needed
 		messages := a.Conversation
 
-		// Auto-compaction check
 		currentTokens := 0
 		if a.LastTokenUsage != nil {
 			currentTokens = a.LastTokenUsage.TotalTokens
@@ -485,12 +502,10 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 			threshold = int(float64(currentModel.MaxTokens) * 0.8)
 		}
 
-		// Start the "thinking" spinner early - it will stay until content arrives or turn ends
 		spinner := ui.NewSpinner("")
 		spinner.Start()
 
 		if currentTokens > threshold {
-			// Temporarily stop thinking spinner to show compaction progress
 			spinner.Stop()
 			ui.PrintfSafe("\n⚠️  Context threshold reached (%d/%d tokens). Auto-compacting...\n", currentTokens, currentModel.MaxTokens)
 			err := CompactContext(a)
@@ -500,11 +515,9 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 			} else {
 				messages = a.Conversation
 			}
-			// Restart thinking spinner
 			spinner.Start()
 		}
 
-		// Use a reasonable max tokens for completion
 		maxTokens := 8192
 		if currentModel.MaxCompletionTokens > 0 {
 			maxTokens = currentModel.MaxCompletionTokens
@@ -520,15 +533,16 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 			}
 		}
 
-		req := openai.ChatCompletionRequest{
-			Model:     currentModel.Name,
-			Messages:  messages,
-			Tools:     toolManager.GetToolDefinitions(),
-			MaxTokens: maxTokens,
-			Stream:    true,
+		req := llm.Request{
+			Model:       currentModel.Name,
+			Messages:    convertToLLMMessages(messages),
+			Tools:       toolManager.GetToolDefinitions(),
+			MaxTokens:   maxTokens,
+			Temperature: 0.7,
+			TopP:        1.0,
+			Stream:      true,
 		}
 
-		// Create streaming request
 		streamChan, err := a.LLM.CreateStream(sessionCtx, req)
 		if err != nil {
 			if sessionCtx.Err() != nil {
@@ -544,7 +558,7 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 
 				if strings.Contains(errStr, "context") || strings.Contains(errStr, "too long") ||
 					strings.Contains(errStr, "maximum") || a.LastTokenUsage != nil && a.LastTokenUsage.PromptTokens > 6000 {
-					
+
 					re := regexp.MustCompile(`context length is (\d+)`)
 					matches := re.FindStringSubmatch(errStr)
 					if len(matches) > 1 {
@@ -569,16 +583,15 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 					}
 				}
 
-				reqFallback := openai.ChatCompletionRequest{
+				reqFallback := llm.Request{
 					Model:     currentModel.Name,
-					Messages:  messages,
+					Messages:  convertToLLMMessages(messages),
 					MaxTokens: 2000,
 				}
 
 				ui.PrintlnSafe("🔄 Retrying with simplified request...")
 				spinner.Start()
 
-				// Monitor interrupt during fallback
 				resp, err := a.LLM.CreateCompletion(sessionCtx, reqFallback)
 				spinner.Stop()
 
@@ -592,10 +605,12 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 				a.LastTokenUsage = resp.Usage
 				a.TotalTokensUsed += resp.Usage.TotalTokens
 
-				assistantMessage := openai.ChatCompletionMessage{
-					Role:      openai.ChatMessageRoleAssistant,
-					Content:   resp.Content,
-					ToolCalls: resp.ToolCalls,
+				assistantMessage := types.Message{
+					Role:             openai.ChatMessageRoleAssistant,
+					Content:          resp.Content,
+					Reasoning:        resp.Reasoning,
+					ThoughtSignature: resp.ThoughtSignature,
+					ToolCalls:        resp.ToolCalls,
 				}
 				a.Conversation = append(a.Conversation, assistantMessage)
 
@@ -616,7 +631,7 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 				return fmt.Errorf("error calling API: %v", err)
 			}
 		}
-		
+
 		var previousLines []string
 		getTermHeight := func() int {
 			_, height, err := term.GetSize(int(os.Stdout.Fd()))
@@ -627,8 +642,10 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 		}
 
 		var fullContent strings.Builder
+		var fullReasoning strings.Builder
+		var thoughtSignature []byte
 		var toolCalls []openai.ToolCall
-		
+
 		genStartTime := time.Now()
 		contextTokens := GetContextTokens(a)
 
@@ -637,7 +654,7 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 			if usage != nil {
 				genTokens = usage.CompletionTokens
 			} else {
-				genLen := fullContent.Len()
+				genLen := fullContent.Len() + fullReasoning.Len()
 				for _, tc := range toolCalls {
 					genLen += len(tc.Function.Name) + len(tc.Function.Arguments)
 				}
@@ -650,12 +667,10 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 				speed = float64(genTokens) / duration
 			}
 
-			// Update window title via spinner
 			modelName := a.Config.Models[a.Config.CurrentModel].Name
 			title := fmt.Sprintf("MCode | %s | %d ctx | %d gen (%.1f t/s)", modelName, contextTokens, genTokens, speed)
 			spinner.SetTitle(title)
 
-			// Update spinner if active
 			msg := ""
 			if genTokens == 0 {
 				msg = "Thinking..."
@@ -681,9 +696,19 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 			if response.FinishReason != "" {
 				finishReason = response.FinishReason
 			}
-			
-			// Ensure spinner is running for any generation signal
-			if response.Content != "" || len(response.ToolCalls) > 0 {
+
+			if len(response.ThoughtSignature) > 0 {
+				thoughtSignature = append(thoughtSignature, response.ThoughtSignature...)
+			}
+
+			if response.Content != "" || response.Reasoning != "" || len(response.ToolCalls) > 0 {
+				spinner.Start()
+			}
+
+			if response.Reasoning != "" {
+				fullReasoning.WriteString(response.Reasoning)
+				spinner.Stop()
+				ui.PrintSafe(types.ColorGray + response.Reasoning + types.ColorReset)
 				spinner.Start()
 			}
 
@@ -714,7 +739,7 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 					linesToBacktrack = termHeight - 1
 					diffIdx = len(previousLines) - linesToBacktrack
 					if diffIdx < 0 {
-						diffIdx = 0 
+						diffIdx = 0
 					}
 				}
 
@@ -757,7 +782,6 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 			}
 		}
 
-		// Final check for tool call validity - ensure every tool call has an ID and type
 		validToolCalls := make([]openai.ToolCall, 0)
 		for _, tc := range toolCalls {
 			if tc.Function.Name != "" {
@@ -769,8 +793,7 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 		}
 		toolCalls = validToolCalls
 
-		// Accurate token counting using tiktoken
-		responseTokens := tokens.CountTokens(currentModel.Name, fullContent.String())
+		responseTokens := tokens.CountTokens(currentModel.Name, fullContent.String()) + tokens.CountTokens(currentModel.Name, fullReasoning.String())
 		for _, tc := range toolCalls {
 			responseTokens += tokens.CountTokens(currentModel.Name, tc.Function.Name)
 			responseTokens += tokens.CountTokens(currentModel.Name, tc.Function.Arguments)
@@ -780,7 +803,6 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 			responseTokens = 1
 		}
 
-		// Use accurate context counting
 		contextEstimate := tokens.CountMessagesTokens(currentModel.Name, a.Conversation)
 
 		a.LastTokenUsage = &openai.Usage{
@@ -790,30 +812,26 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 		}
 		a.TotalTokensUsed += responseTokens
 
-		// Create assistant message with accumulated content and tool calls
-		assistantMessage := openai.ChatCompletionMessage{
-			Role:      openai.ChatMessageRoleAssistant,
-			Content:   fullContent.String(),
-			ToolCalls: toolCalls,
+		assistantMessage := types.Message{
+			Role:             openai.ChatMessageRoleAssistant,
+			Content:          fullContent.String(),
+			Reasoning:        fullReasoning.String(),
+			ThoughtSignature: thoughtSignature,
+			ToolCalls:        toolCalls,
 		}
 
-		// CRITICAL FIX: Ensure content is never truly undefined/nil for providers that are picky.
-		// If content is empty and there are no tool calls, some providers reject it.
-		if assistantMessage.Content == "" && len(assistantMessage.ToolCalls) == 0 {
-			assistantMessage.Content = " " // Use a single space as a fallback
+		if assistantMessage.Content == "" && assistantMessage.Reasoning == "" && len(assistantMessage.ToolCalls) == 0 {
+			assistantMessage.Content = " "
 		}
 
 		a.Conversation = append(a.Conversation, assistantMessage)
 
-		// Ensure spinner is stopped before we might enter tool call handling
-		// or before we break the loop
 		spinner.Stop()
 
 		if finishReason == "length" {
 			fmt.Printf("\n⚠️  Warning: Generation truncated due to length limit!\n")
 		}
 
-		// Check if the response contains tool calls
 		if len(toolCalls) > 0 {
 			tokenStats := ""
 			if a.LastTokenUsage != nil {
@@ -829,7 +847,6 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 
 	fmt.Println()
 
-	// Show token usage info
 	if a.LastTokenUsage != nil {
 		contextTokens := a.LastTokenUsage.PromptTokens
 		responseTokens := a.LastTokenUsage.CompletionTokens
@@ -840,7 +857,6 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 				types.ColorBlue, contextTokens, responseTokens, totalSessionTokens, types.ColorReset)
 		}
 
-		// Update persistent status display
 		UpdateStatusDisplay(a)
 	}
 
@@ -848,25 +864,21 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 }
 
 // TruncateForLLM truncates string content to a safe length for LLM context.
-// Local LLMs work much better with shorter, high-signal contexts.
 func TruncateForLLM(a *types.Agent, s string, maxChars int) string {
-	limit := 8000 // Default fallback
-	
-	// If model config is available, allow tool output to take up to ~50% of context
+	limit := 8000
+
 	if model, ok := a.Config.Models[a.Config.CurrentModel]; ok && model.MaxTokens > 0 {
-		// Roughly 4 chars per token
 		limit = int(float64(model.MaxTokens) * 0.5 * 4)
 	}
 
 	if maxChars > 0 && maxChars < limit {
 		limit = maxChars
 	}
-	
-	// Sane upper bound for character count (e.g. 100k chars is plenty for one tool output)
+
 	if limit > 100000 {
 		limit = 100000
 	}
-	
+
 	if len(s) <= limit {
 		return s
 	}
@@ -876,12 +888,10 @@ func TruncateForLLM(a *types.Agent, s string, maxChars int) string {
 // handleToolCalls processes tool calls from the AI model
 func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.ToolCall, toolManager *tools.Manager, tokenStats string, truncated bool) error {
 	for _, toolCall := range toolCalls {
-		// Check for context cancellation
 		if ctx.Err() != nil {
 			return ui.ErrInterrupted
 		}
 
-		// Start a spinner while we process this tool call (parse, check permissions, get preview)
 		msg := fmt.Sprintf("Processing %s", toolCall.Function.Name)
 		if tokenStats != "" {
 			msg += " " + tokenStats
@@ -892,14 +902,14 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 		var params map[string]interface{}
 		if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &params); err != nil {
 			spinner.Stop()
-			
+
 			errResult := ""
 			if truncated {
 				errResult = fmt.Sprintf("Error parsing tool parameters (Generation Truncated): %v", err)
 			} else {
 				errResult = fmt.Sprintf("Error parsing tool parameters: %v", err)
 			}
-			
+
 			if errResult == "" {
 				errResult = "Error parsing tool parameters"
 			}
@@ -913,9 +923,8 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 				}
 				fmt.Printf("Partial JSON (len=%d): %s...\n", argLen, toolCall.Function.Arguments[:previewLen])
 			}
-			
-			// Always add a tool response to avoid breaking the conversation
-			a.Conversation = append(a.Conversation, openai.ChatCompletionMessage{
+
+			a.Conversation = append(a.Conversation, types.Message{
 				Role:       openai.ChatMessageRoleTool,
 				Content:    errResult,
 				ToolCallID: toolCall.ID,
@@ -923,14 +932,12 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 			continue
 		}
 
-		// Prepare tool display header
 		toolDisplay := fmt.Sprintf("🔧 %s%s%s", types.ColorCyan, toolCall.Function.Name, types.ColorReset)
 		displayInfo := toolManager.GetDisplayInfo(toolCall.Function.Name, params)
 		if displayInfo != "" {
 			toolDisplay += displayInfo
 		}
 
-		// Check for long-running and permissions
 		isLongRunning := false
 		if toolCall.Function.Name == "bash_command" {
 			if cmdParam, exists := params["command"]; exists {
@@ -964,13 +971,11 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 				if IsFolderApproved(a, folderPath) {
 					shouldAutoExecute = true
 				} else {
-					// We must stop spinner before requesting permission via UI
 					spinner.Stop()
 					if !RequestFolderPermission(a, folderPath) {
 						permissionError = "Permission denied for folder access"
 					} else {
 						shouldAutoExecute = true
-						// Restart spinner for subsequent processing (like GetPreview)
 						spinner.Start()
 					}
 				}
@@ -979,7 +984,7 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 
 		if permissionError != "" {
 			spinner.Stop()
-			a.Conversation = append(a.Conversation, openai.ChatCompletionMessage{
+			a.Conversation = append(a.Conversation, types.Message{
 				Role:       openai.ChatMessageRoleTool,
 				Content:    permissionError,
 				ToolCallID: toolCall.ID,
@@ -987,13 +992,11 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 			continue
 		}
 
-		// Get preview (potentially slow)
 		var preview string
 		if toolCall.Function.Name == "edit_file" || toolCall.Function.Name == "write_file" {
 			preview, _ = toolManager.GetPreview(toolCall.Function.Name, params)
 		}
 
-		// NOW we are ready to show everything and prompt the user
 		spinner.Stop()
 		ui.PrintfSafe("\n%s\n", toolDisplay)
 
@@ -1013,36 +1016,31 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 			}
 			playNotificationSound()
 			ui.PrintSafe(prompt)
-			
+
 			ui.PauseInterruptMonitor()
 			response = ui.ReadConfirmation()
 			ui.ResumeInterruptMonitor()
-			
+
 			if response == "\r" || response == "\n" {
-				response = "" // Treat Enter as default (yes)
+				response = ""
 			}
-			
-			// Echo the choice since raw mode doesn't
+
 			if response == "" {
 				ui.PrintlnSafe("y")
 			} else if response == "i" {
-				// Escape or Ctrl+C from ReadConfirmation
 				ui.PrintlnSafe("cancel")
 			} else {
 				ui.PrintlnSafe(response)
 			}
 		}
 
-		// executeToolBasedOnResponse already has its own spinner
 		result, shouldContinue, err := executeToolBasedOnResponse(ctx, a, response, toolCall, params, isLongRunning, toolManager)
 
-		// If user interrupted or error occurred
 		if err != nil {
-			// Find this tool call in the list and mark all subsequent ones as skipped
 			found := false
 			for _, tc := range toolCalls {
 				if found {
-					a.Conversation = append(a.Conversation, openai.ChatCompletionMessage{
+					a.Conversation = append(a.Conversation, types.Message{
 						Role:       openai.ChatMessageRoleTool,
 						Content:    "Tool call skipped due to user interruption",
 						ToolCallID: tc.ID,
@@ -1056,11 +1054,10 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 		}
 
 		if !shouldContinue {
-			// Find this tool call in the list and mark all subsequent ones as skipped
 			found := false
 			for _, tc := range toolCalls {
 				if found {
-					a.Conversation = append(a.Conversation, openai.ChatCompletionMessage{
+					a.Conversation = append(a.Conversation, types.Message{
 						Role:       openai.ChatMessageRoleTool,
 						Content:    "Tool call skipped due to user interruption",
 						ToolCallID: tc.ID,
@@ -1073,33 +1070,28 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 			break
 		}
 
-		// Display tool output to user
 		if result != "" && (response == "" || response == "y" || response == "yes" || response == "b" || response == "background") {
-			// Always show errors in red
 			if strings.HasPrefix(result, "Error:") {
 				ui.PrintfSafe("\n%s> %s%s\n", types.ColorRed, result, types.ColorReset)
 			} else if toolCall.Function.Name == "edit_file" || toolCall.Function.Name == "write_file" {
-				ui.PrintlnSafe() // Add blank line after tool call
-				// Only stream diff/output if it wasn't already shown in preview
+				ui.PrintlnSafe()
 				if preview == "" {
 					streamOutput(result)
 				} else {
 					ui.PrintfSafe("✅ %s applied successfully\n\n", toolCall.Function.Name)
 				}
 			} else if toolCall.Function.Name == "read_file" {
-				ui.PrintlnSafe() // Add blank line after tool call
+				ui.PrintlnSafe()
 				offset := 0
 				if v, ok := params["offset"].(float64); ok {
 					offset = int(v)
 				}
 
-				// Find where the truncation message starts to count actual file lines
 				actualResult := result
 				if idx := strings.Index(result, "\n\n[... File truncated."); idx != -1 {
 					actualResult = result[:idx]
 				}
 
-				// Count lines (including empty ones)
 				var lineCount int
 				if actualResult == "" {
 					lineCount = 0
@@ -1114,16 +1106,15 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 					ui.PrintfSafe("%s> Read 0 lines (empty or at end of file)%s\n", types.ColorCyan, types.ColorReset)
 				}
 			} else if toolCall.Function.Name == "search_code" {
-				ui.PrintlnSafe() // Add blank line after tool call
+				ui.PrintlnSafe()
 				lineCount := strings.Count(result, "\n")
 				ui.PrintfSafe("%s> Found %d matches%s\n", types.ColorCyan, lineCount, types.ColorReset)
 			} else if toolCall.Function.Name == "list_files" {
-				ui.PrintlnSafe() // Add blank line after tool call
+				ui.PrintlnSafe()
 				lineCount := strings.Count(result, "\n")
 				ui.PrintfSafe("%s> Listed %d items%s\n", types.ColorCyan, lineCount, types.ColorReset)
 			} else if toolCall.Function.Name != "read_file" && toolCall.Function.Name != "list_files" && toolCall.Function.Name != "bash_command" {
-				ui.PrintlnSafe() // Add blank line after tool call
-				// Generic output display (skip read_file, list_files and bash_command to avoid clutter/duplication)
+				ui.PrintlnSafe()
 				ui.PrintfSafe("%s> Tool Output:%s\n", types.ColorCyan, types.ColorReset)
 				if len(result) > 2000 {
 					ui.PrintlnSafe(result[:2000] + "... (truncated)")
@@ -1133,14 +1124,14 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 			}
 		}
 
-		// Add tool result to conversation with truncation safety
-		truncatedResult := TruncateForLLM(a, result, 8000) // Now strictly 8k max
+		truncatedResult := TruncateForLLM(a, result, 8000)
 		if truncatedResult == "" {
-			truncatedResult = " " // Fallback to space for strict providers
+			truncatedResult = " "
 		}
-		a.Conversation = append(a.Conversation, openai.ChatCompletionMessage{
+		a.Conversation = append(a.Conversation, types.Message{
 			Role:       openai.ChatMessageRoleTool,
 			Content:    truncatedResult,
+			Name:       toolCall.Function.Name,
 			ToolCallID: toolCall.ID,
 		})
 
@@ -1154,7 +1145,6 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 // playNotificationSound plays a notification sound
 func playNotificationSound() {
 	go func() {
-		// Check if terminal is in foreground on macOS
 		cmd := exec.Command("osascript", "-e", `tell application "System Events" to get name of first application process whose frontmost is true`)
 		output, err := cmd.Output()
 		if err == nil {
@@ -1170,8 +1160,6 @@ func playNotificationSound() {
 			}
 		}
 	}()
-
-	// Always show ASCII bell (for taskbar notification)
 	fmt.Print("\a")
 }
 
@@ -1184,22 +1172,16 @@ func executeToolBasedOnResponse(ctx context.Context, a *types.Agent, response st
 	}
 
 	if response == "" || response == "y" || response == "yes" {
-		// Execute the tool
 		toolFunc, exists := a.Tools[toolCall.Function.Name]
 		if !exists {
 			fmt.Printf("Unknown tool: %s\n", toolCall.Function.Name)
 			result = "Error: Unknown tool"
 		} else {
-			// Start spinner for tool execution
 			spinner := ui.NewSpinner(fmt.Sprintf("Executing %s...", toolCall.Function.Name))
 			spinner.Start()
 
-			// Tool execution doesn't support context yet, so we just run it
-			// and check context afterward
 			var err error
 			result, err = toolFunc(params)
-
-			// Stop spinner
 			spinner.Stop()
 
 			if ctx.Err() != nil {
@@ -1232,8 +1214,7 @@ func executeToolBasedOnResponse(ctx context.Context, a *types.Agent, response st
 
 // streamOutput simulates streaming output for content
 func streamOutput(content string) {
-	// Stream the content in small chunks
-	chunkSize := 10 // Larger chunk size for faster display
+	chunkSize := 10
 	for i := 0; i < len(content); i += chunkSize {
 		end := i + chunkSize
 		if end > len(content) {
@@ -1242,9 +1223,7 @@ func streamOutput(content string) {
 
 		chunk := content[i:end]
 		ui.PrintSafe(chunk)
-
-		// Very small delay
 		time.Sleep(1 * time.Millisecond)
 	}
-	ui.PrintlnSafe() // Ensure newline at end
+	ui.PrintlnSafe()
 }

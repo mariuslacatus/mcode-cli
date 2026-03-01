@@ -11,10 +11,12 @@ import (
 
 // Message represents a single conversation message
 type Message struct {
-	Role      string            `json:"role"`
-	Content   string            `json:"content"`
-	ToolID    string            `json:"tool_call_id,omitempty"`
-	ToolCalls []ToolCall        `json:"tool_calls,omitempty"`
+	Role             string     `json:"role"`
+	Content          string     `json:"content"`
+	Reasoning        string     `json:"reasoning,omitempty"`
+	ThoughtSignature []byte     `json:"thought_signature,omitempty"`
+	ToolID           string     `json:"tool_call_id,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 
 // ToolCall represents a saved tool call
@@ -32,13 +34,13 @@ type FunctionCall struct {
 
 // Conversation represents a complete conversation session
 type Conversation struct {
-	ID        string    `json:"id"`
-	Title     string    `json:"title"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Messages  []Message `json:"messages"`
-	TokensUsed int      `json:"tokens_used,omitempty"`
-	Model     string    `json:"model"`
+	ID         string    `json:"id"`
+	Title      string    `json:"title"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+	Messages   []Message `json:"messages"`
+	TokensUsed int       `json:"tokens_used,omitempty"`
+	Model      string    `json:"model"`
 }
 
 // Manager handles conversation save/load operations
@@ -166,16 +168,16 @@ func GenerateID() string {
 
 // AutoSaveConfig defines automatic save behavior
 type AutoSaveConfig struct {
-	MaxMessages  int `json:"max_messages"`  // Auto-save after this many messages
-	MaxMinutes   int `json:"max_minutes"`   // Auto-save after this many minutes
-	KeepLast     int `json:"keep_last"`     // Keep only last N conversations
+	MaxMessages int `json:"max_messages"` // Auto-save after this many messages
+	MaxMinutes  int `json:"max_minutes"`  // Auto-save after this many minutes
+	KeepLast    int `json:"keep_last"`    // Keep only last N conversations
 }
 
 // DefaultAutoSaveConfig returns the default auto-save configuration
 func DefaultAutoSaveConfig() AutoSaveConfig {
 	return AutoSaveConfig{
-		MaxMessages:  10,
-		MaxMinutes:   30,
-		KeepLast:     20,
+		MaxMessages: 10,
+		MaxMinutes:  30,
+		KeepLast:    20,
 	}
 }

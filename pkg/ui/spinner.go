@@ -33,7 +33,7 @@ func (s *Spinner) Start() {
 	s.done = make(chan bool)
 	s.cleared = make(chan bool)
 	s.active = true
-	
+
 	msg := s.message
 	title := s.title
 	s.mu.Unlock()
@@ -42,7 +42,7 @@ func (s *Spinner) Start() {
 	go func() {
 		spinnerChars := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 		i := 0
-		
+
 		// Initial frame
 		if title != "" {
 			PrintfSafe("\033]0;%s\007", title)

@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -97,9 +98,9 @@ func (h *Handler) Handle(command string) (bool, error) {
 
 // clearContext clears the conversation context
 func (h *Handler) clearContext() {
-	h.agent.Conversation = []openai.ChatCompletionMessage{}
+	h.agent.Conversation = []types.Message{}
 	h.agent.LastTokenUsage = nil
-	// Don't reset TotalTokensUsed - keep session total
+	h.agent.CurrentConvID = ""
 
 	// Clear terminal
 	fmt.Print("\033[2J\033[H")
@@ -165,6 +166,9 @@ func (h *Handler) listModels() error {
 		fmt.Printf("📱 %s%s\n", key, status)
 		fmt.Printf("   Name: %s\n", model.Name)
 		fmt.Printf("   URL:  %s\n", model.BaseURL)
+		if model.Provider != "" {
+			fmt.Printf("   Provider: %s\n", model.Provider)
+		}
 		if model.APIKey != "" {
 			if len(model.APIKey) > 4 {
 				fmt.Printf("   API Key: ***%s\n", model.APIKey[len(model.APIKey)-4:])
@@ -200,14 +204,30 @@ func (h *Handler) switchModel(modelKey string) error {
 		return fmt.Errorf("failed to save config: %v", err)
 	}
 
-	// Update client
-	clientConfig := openai.DefaultConfig(model.APIKey)
-	clientConfig.BaseURL = model.BaseURL
-	h.agent.LLM = llm.NewOpenAIProvider(openai.NewClientWithConfig(clientConfig))
+	// Update provider
+	var provider llm.Provider
+	if model.Provider == "gemini" || strings.Contains(strings.ToLower(model.Name), "gemini") {
+		geminiProvider, err := llm.NewGeminiProvider(context.Background(), model.APIKey)
+		if err != nil {
+			fmt.Printf("Error initializing Gemini provider: %v. Falling back to OpenAI.\n", err)
+			clientConfig := openai.DefaultConfig(model.APIKey)
+			clientConfig.BaseURL = model.BaseURL
+			provider = llm.NewOpenAIProvider(openai.NewClientWithConfig(clientConfig))
+		} else {
+			provider = geminiProvider
+		}
+	} else {
+		clientConfig := openai.DefaultConfig(model.APIKey)
+		clientConfig.BaseURL = model.BaseURL
+		provider = llm.NewOpenAIProvider(openai.NewClientWithConfig(clientConfig))
+	}
+	h.agent.LLM = provider
 
 	fmt.Printf("✅ Switched to model: %s\n", modelKey)
 	fmt.Printf("📱 Name: %s\n", model.Name)
-	fmt.Printf("🌐 URL: %s\n", model.BaseURL)
+	if model.BaseURL != "" {
+		fmt.Printf("🌐 URL: %s\n", model.BaseURL)
+	}
 
 	return nil
 }
@@ -683,17 +703,19 @@ func (h *Handler) showConvInfo(id string) error {
 }
 
 // convertMessages converts agent conversation to conversation manager format
-func convertMessages(agentMsgs []openai.ChatCompletionMessage) []conversation.Message {
+func convertMessages(agentMsgs []types.Message) []conversation.Message {
 	convMsgs := make([]conversation.Message, 0, len(agentMsgs))
 	for _, msg := range agentMsgs {
 		cm := conversation.Message{
-			Role:    msg.Role,
-			Content: msg.Content,
+			Role:             msg.Role,
+			Content:          msg.Content,
+			Reasoning:        msg.Reasoning,
+			ThoughtSignature: msg.ThoughtSignature,
 		}
 		if msg.Role == openai.ChatMessageRoleTool {
 			cm.ToolID = msg.ToolCallID
 		}
-		
+
 		if len(msg.ToolCalls) > 0 {
 			cm.ToolCalls = make([]conversation.ToolCall, len(msg.ToolCalls))
 			for i, tc := range msg.ToolCalls {
@@ -713,12 +735,14 @@ func convertMessages(agentMsgs []openai.ChatCompletionMessage) []conversation.Me
 }
 
 // convertMessagesFromConversation converts conversation manager format to agent format
-func convertMessagesFromConversation(conv *conversation.Conversation) []openai.ChatCompletionMessage {
-	agentMsgs := make([]openai.ChatCompletionMessage, 0, len(conv.Messages))
+func convertMessagesFromConversation(conv *conversation.Conversation) []types.Message {
+	agentMsgs := make([]types.Message, 0, len(conv.Messages))
 	for _, msg := range conv.Messages {
-		am := openai.ChatCompletionMessage{
-			Role:    msg.Role,
-			Content: msg.Content,
+		am := types.Message{
+			Role:             msg.Role,
+			Content:          msg.Content,
+			Reasoning:        msg.Reasoning,
+			ThoughtSignature: msg.ThoughtSignature,
 		}
 		if msg.Role == openai.ChatMessageRoleTool {
 			am.ToolCallID = msg.ToolID

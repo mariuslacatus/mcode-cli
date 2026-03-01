@@ -27,7 +27,7 @@ func GenerateDiff(oldContent, newContent, filename string) string {
 	opcodes := matcher.GetOpCodes()
 
 	contextLines := 3
-	
+
 	// Determine the first line we'll actually show
 	firstLineShown := len(oldLines) // Default to beyond file end
 	for _, opcode := range opcodes {
@@ -37,28 +37,28 @@ func GenerateDiff(oldContent, newContent, filename string) string {
 			break
 		}
 	}
-	
+
 	// Show start ellipsis if we're not starting from the beginning
 	if firstLineShown > 0 {
 		result.WriteString("      ...  │ \n")
 	}
-	
+
 	for opcodeIdx, opcode := range opcodes {
 		tag := opcode.Tag
 		i1, i2, j1, j2 := opcode.I1, opcode.I2, opcode.J1, opcode.J2
 
 		switch tag {
 		case 'e': // equal - show limited context only around changes
-			
+
 			// Check if there's a change before this equal section
 			hasPreviousChange := opcodeIdx > 0
-			
-			// Check if there's a change after this equal section  
+
+			// Check if there's a change after this equal section
 			hasNextChange := opcodeIdx < len(opcodes)-1
-			
+
 			if hasPreviousChange && hasNextChange {
 				// Between changes - show context after previous and before next
-				
+
 				// But limit to contextLines around each change
 				if i2-i1 > contextLines*2 {
 					// Show first contextLines (after previous change)
@@ -67,10 +67,10 @@ func GenerateDiff(oldContent, newContent, filename string) string {
 						newLineNum := j1 + (i - i1) + 1
 						result.WriteString(fmt.Sprintf(" %4d %4d │ %s\n", oldLineNum, newLineNum, oldLines[i]))
 					}
-					
+
 					// Add ellipsis for gap
 					result.WriteString("      ...  │ \n")
-					
+
 					// Show last contextLines (before next change)
 					for i := max(i2-contextLines, i1+contextLines); i < i2; i++ {
 						oldLineNum := i + 1
@@ -138,7 +138,7 @@ func GenerateDiff(oldContent, newContent, filename string) string {
 			break
 		}
 	}
-	
+
 	// Show end ellipsis if we're not ending at the last line
 	if lastLineShown < len(oldLines)-1 {
 		result.WriteString("      ...  │ \n")

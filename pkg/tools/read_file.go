@@ -81,7 +81,7 @@ func (t *ReadFileTool) Execute(params map[string]interface{}) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("error opening file: %v", err)
 	}
-	
+
 	lineScanner := bufio.NewScanner(f)
 	totalLines := 0
 	for lineScanner.Scan() {
@@ -131,7 +131,7 @@ func (t *ReadFileTool) GetDisplayInfo(params map[string]interface{}) string {
 	if err := t.Unmarshal(params, &args); err != nil {
 		return ""
 	}
-	
+
 	absPath := args.Path
 	relPath, err := filepath.Rel(".", absPath)
 	if err == nil {

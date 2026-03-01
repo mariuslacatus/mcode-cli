@@ -44,8 +44,8 @@ func TestReplaceInContent(t *testing.T) {
 }`,
 		},
 		{
-			name: "Whitespace normalized match",
-			content: `func main() {  fmt.Println("hello")  }`,
+			name:      "Whitespace normalized match",
+			content:   `func main() {  fmt.Println("hello")  }`,
 			oldString: `func main() { fmt.Println("hello") }`,
 			newString: `func main() { fmt.Println("hi") }`,
 			want:      `func main() { fmt.Println("hi") }`,

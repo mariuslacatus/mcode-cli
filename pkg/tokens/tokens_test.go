@@ -57,7 +57,7 @@ func TestCountMessagesTokens(t *testing.T) {
 
 	model := "gpt-4"
 	got := CountMessagesTokens(model, messages)
-	
+
 	// System: ~7 tokens, User: ~1 token, Overhead: ~7 tokens
 	// Should be around 15-20 tokens
 	if got < 10 || got > 30 {

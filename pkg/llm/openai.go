@@ -16,8 +16,8 @@ func NewOpenAIProvider(client *openai.Client) *OpenAIProvider {
 	return &OpenAIProvider{client: client}
 }
 
-func (p *OpenAIProvider) CreateCompletion(ctx context.Context, req openai.ChatCompletionRequest) (*Response, error) {
-	resp, err := p.client.CreateChatCompletion(ctx, req)
+func (p *OpenAIProvider) CreateCompletion(ctx context.Context, req Request) (*Response, error) {
+	resp, err := p.client.CreateChatCompletion(ctx, convertToOpenAIRequest(req))
 	if err != nil {
 		return nil, err
 	}
@@ -35,8 +35,8 @@ func (p *OpenAIProvider) CreateCompletion(ctx context.Context, req openai.ChatCo
 	}, nil
 }
 
-func (p *OpenAIProvider) CreateStream(ctx context.Context, req openai.ChatCompletionRequest) (<-chan StreamResponse, error) {
-	stream, err := p.client.CreateChatCompletionStream(ctx, req)
+func (p *OpenAIProvider) CreateStream(ctx context.Context, req Request) (<-chan StreamResponse, error) {
+	stream, err := p.client.CreateChatCompletionStream(ctx, convertToOpenAIRequest(req))
 	if err != nil {
 		return nil, err
 	}
@@ -70,4 +70,27 @@ func (p *OpenAIProvider) CreateStream(ctx context.Context, req openai.ChatComple
 	}()
 
 	return out, nil
+}
+
+func convertToOpenAIRequest(req Request) openai.ChatCompletionRequest {
+	var messages []openai.ChatCompletionMessage
+	for _, m := range req.Messages {
+		messages = append(messages, openai.ChatCompletionMessage{
+			Role:       m.Role,
+			Content:    m.Content,
+			Name:       m.Name,
+			ToolCallID: m.ToolCallID,
+			ToolCalls:  m.ToolCalls,
+		})
+	}
+
+	return openai.ChatCompletionRequest{
+		Model:       req.Model,
+		Messages:    messages,
+		Tools:       req.Tools,
+		Temperature: req.Temperature,
+		MaxTokens:   req.MaxTokens,
+		TopP:        req.TopP,
+		Stream:      req.Stream,
+	}
 }
