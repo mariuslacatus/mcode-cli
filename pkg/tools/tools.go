@@ -59,6 +59,8 @@ func (m *Manager) RegisterTools() {
 	m.addTool(&EditFileTool{})
 	m.addTool(&WriteFileTool{})
 	m.addTool(&SearchCodeTool{})
+	m.addTool(&WebSearchTool{})
+	m.addTool(&WebFetchTool{})
 
 	// Maintain the old map for now to avoid breaking types.Agent if it's used elsewhere
 	for name, tool := range m.tools {
@@ -82,6 +84,10 @@ func (m *Manager) addTool(tool Tool) {
 	case *WriteFileTool:
 		t.manager = m
 	case *SearchCodeTool:
+		t.manager = m
+	case *WebSearchTool:
+		t.manager = m
+	case *WebFetchTool:
 		t.manager = m
 	}
 	m.tools[tool.Name()] = tool

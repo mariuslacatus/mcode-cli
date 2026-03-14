@@ -45,3 +45,19 @@ type SearchCodeArgs struct {
 	Pattern   string `json:"pattern"`
 	Directory string `json:"directory,omitempty"`
 }
+
+// WebSearchArgs defines the arguments for the web_search tool
+type WebSearchArgs struct {
+	Query          string   `json:"query"`
+	MaxResults     int      `json:"max_results,omitempty"`
+	IncludeDomains []string `json:"include_domains,omitempty"`
+	ExcludeDomains []string `json:"exclude_domains,omitempty"`
+}
+
+// WebFetchArgs defines the arguments for the web_fetch tool
+type WebFetchArgs struct {
+	URL            string `json:"url"`
+	Format         string `json:"format,omitempty"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+	MaxChars       int    `json:"max_chars,omitempty"`
+}

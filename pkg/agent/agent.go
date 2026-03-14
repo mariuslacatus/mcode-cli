@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -79,14 +80,19 @@ func New() *types.Agent {
 	for _, folder := range cfg.ApprovedFolders {
 		approvedFolders[folder] = true
 	}
+	approvedWebDomains := make(map[string]bool)
+	for _, domain := range cfg.ApprovedWebDomains {
+		approvedWebDomains[normalizeApprovedWebDomain(domain)] = true
+	}
 
 	agent := &types.Agent{
-		LLM:             provider,
-		Conversation:    []types.Message{},
-		Tools:           make(map[string]func(map[string]interface{}) (string, error)),
-		Config:          cfg,
-		ConfigPath:      configPath,
-		ApprovedFolders: approvedFolders,
+		LLM:                provider,
+		Conversation:       []types.Message{},
+		Tools:              make(map[string]func(map[string]interface{}) (string, error)),
+		Config:             cfg,
+		ConfigPath:         configPath,
+		ApprovedFolders:    approvedFolders,
+		ApprovedWebDomains: approvedWebDomains,
 	}
 
 	// Initialize tools
@@ -232,6 +238,141 @@ func setAutoApproveEditScope(a *types.Agent, folderPath string) {
 func clearAutoApproveEditScope(a *types.Agent) {
 	a.AutoApproveEdit = false
 	a.AutoApproveEditRoot = ""
+}
+
+func normalizeApprovedWebDomain(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return ""
+	}
+
+	value = strings.TrimPrefix(value, "*.")
+	value = strings.TrimPrefix(value, ".")
+
+	if strings.Contains(value, "://") {
+		if parsedURL, err := url.Parse(value); err == nil {
+			value = parsedURL.Hostname()
+		}
+	}
+
+	if idx := strings.Index(value, "/"); idx >= 0 {
+		value = value[:idx]
+	}
+	if idx := strings.Index(value, ":"); idx >= 0 {
+		value = value[:idx]
+	}
+
+	return value
+}
+
+func IsWebDomainApproved(a *types.Agent, host string) bool {
+	host = normalizeApprovedWebDomain(host)
+	if host == "" {
+		return false
+	}
+
+	if a.ApprovedWebDomains["*"] {
+		return true
+	}
+
+	for approvedDomain := range a.ApprovedWebDomains {
+		if host == approvedDomain || strings.HasSuffix(host, "."+approvedDomain) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func RequestWebSearchPermission(a *types.Agent) (bool, error) {
+	if a.Config.WebSearchEnabled {
+		return true, nil
+	}
+
+	ui.PrintfSafe("🌐 Request web search access\n")
+	ui.PrintSafe("❓ Allow the agent to query the public web search backend for current information? (Y/n/Esc to cancel): ")
+	playNotificationSound()
+
+	ui.PauseInterruptMonitor()
+	response := ui.ReadConfirmation()
+	ui.ResumeInterruptMonitor()
+
+	if response == "\r" || response == "\n" {
+		response = ""
+	}
+
+	if response == "" {
+		ui.PrintlnSafe("y")
+	} else if response == "i" {
+		ui.PrintlnSafe("cancel")
+		return false, ui.ErrInterrupted
+	} else {
+		ui.PrintlnSafe(response)
+	}
+
+	if response == "" || response == "y" || response == "yes" {
+		a.Config.WebSearchEnabled = true
+		if err := config.Save(a.ConfigPath, a.Config); err != nil {
+			ui.PrintfSafe("⚠️  Warning: Failed to save web search permission: %v\n", err)
+		}
+		ui.PrintfSafe("✅ Web search access granted\n")
+		return true, nil
+	}
+
+	ui.PrintfSafe("❌ Web search access denied\n")
+	return false, nil
+}
+
+func RequestWebDomainPermission(a *types.Agent, rawURL string) (bool, error) {
+	parsedURL, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		ui.PrintfSafe("Error resolving URL: %v\n", err)
+		return false, nil
+	}
+
+	host := normalizeApprovedWebDomain(parsedURL.Hostname())
+	if host == "" {
+		ui.PrintfSafe("Error: URL host is required\n")
+		return false, nil
+	}
+
+	if IsWebDomainApproved(a, host) {
+		return true, nil
+	}
+
+	ui.PrintfSafe("🌐 Request web fetch access: %s\n", host)
+	ui.PrintSafe("❓ Allow tool access to this domain and its subdomains? (Y/n/Esc to cancel): ")
+	playNotificationSound()
+
+	ui.PauseInterruptMonitor()
+	response := ui.ReadConfirmation()
+	ui.ResumeInterruptMonitor()
+
+	if response == "\r" || response == "\n" {
+		response = ""
+	}
+
+	if response == "" {
+		ui.PrintlnSafe("y")
+	} else if response == "i" {
+		ui.PrintlnSafe("cancel")
+		return false, ui.ErrInterrupted
+	} else {
+		ui.PrintlnSafe(response)
+	}
+
+	if response == "" || response == "y" || response == "yes" {
+		a.ApprovedWebDomains[host] = true
+		a.Config.ApprovedWebDomains = append(a.Config.ApprovedWebDomains, host)
+		if err := config.Save(a.ConfigPath, a.Config); err != nil {
+			ui.PrintfSafe("⚠️  Warning: Failed to save web domain permission: %v\n", err)
+		}
+		ui.PrintfSafe("✅ Web fetch access granted: %s\n", host)
+		return true, nil
+	}
+
+	ui.PrintfSafe("❌ Web fetch access denied\n")
+	return false, nil
 }
 
 // RequestFolderPermission requests permission for folder access
@@ -472,7 +613,8 @@ CORE STRATEGY & EFFICIENCY (LOCAL LLM OPTIMIZED):
 1.  **Understand Before Reading:** Use 'list_files' to map the project and 'search_code' to find relevant symbols.
 2.  **Read Smartly:** Use 'read_file'. If a file is large (> 300 lines), it will automatically truncate. Use 'offset' and 'limit' to read specific chunks. NEVER read massive files entirely.
 3.  **Edit Surgically:** Prefer 'edit_file' (incremental edits) over 'write_file' (full replacement).
-4.  **Stay High-Signal:** Your primary priority is preventing context inflation. Keep tool outputs and conversation history focused on the immediate task.
+4.  **Use the Web When Needed:** Use 'web_search' for current external facts, docs, releases, or information that is not in the local workspace. Use 'web_fetch' to read the contents of a specific URL after identifying it.
+5.  **Stay High-Signal:** Your primary priority is preventing context inflation. Keep tool outputs and conversation history focused on the immediate task.
 
 CORRECT WORKFLOW EXAMPLE:
 User: "Fix the bug in main.go"
@@ -1008,7 +1150,58 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 
 		isEditTool := toolCall.Function.Name == "edit_file" || toolCall.Function.Name == "write_file"
 
-		if toolCall.Function.Name == "list_files" || toolCall.Function.Name == "read_file" || toolCall.Function.Name == "preview_edit" || toolCall.Function.Name == "search_code" || toolCall.Function.Name == "edit_file" || toolCall.Function.Name == "write_file" {
+		if toolCall.Function.Name == "web_search" {
+			spinner.Stop()
+			approved, err := RequestWebSearchPermission(a)
+			if err == ui.ErrInterrupted {
+				found := false
+				for _, tc := range toolCalls {
+					if found {
+						a.Conversation = append(a.Conversation, types.Message{
+							Role:       openai.ChatMessageRoleTool,
+							Content:    "Tool call skipped due to user interruption",
+							ToolCallID: tc.ID,
+						})
+					}
+					if tc.ID == toolCall.ID {
+						found = true
+					}
+				}
+				return err
+			}
+			if !approved {
+				permissionError = "Permission denied for web search"
+			} else {
+				shouldAutoExecute = true
+				spinner.Start()
+			}
+		} else if toolCall.Function.Name == "web_fetch" {
+			rawURL, _ := params["url"].(string)
+			spinner.Stop()
+			approved, err := RequestWebDomainPermission(a, rawURL)
+			if err == ui.ErrInterrupted {
+				found := false
+				for _, tc := range toolCalls {
+					if found {
+						a.Conversation = append(a.Conversation, types.Message{
+							Role:       openai.ChatMessageRoleTool,
+							Content:    "Tool call skipped due to user interruption",
+							ToolCallID: tc.ID,
+						})
+					}
+					if tc.ID == toolCall.ID {
+						found = true
+					}
+				}
+				return err
+			}
+			if !approved {
+				permissionError = "Permission denied for web fetch"
+			} else {
+				shouldAutoExecute = true
+				spinner.Start()
+			}
+		} else if toolCall.Function.Name == "list_files" || toolCall.Function.Name == "read_file" || toolCall.Function.Name == "preview_edit" || toolCall.Function.Name == "search_code" || toolCall.Function.Name == "edit_file" || toolCall.Function.Name == "write_file" {
 			// Try "path" first, then "filePath"
 			pathVal := params["path"]
 			if pathVal == nil {
@@ -1247,6 +1440,12 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 				ui.PrintlnSafe()
 				lineCount := strings.Count(result, "\n")
 				ui.PrintfSafe("%s> Found %d matches%s\n", types.ColorCyan, lineCount, types.ColorReset)
+			} else if toolCall.Function.Name == "web_search" {
+				ui.PrintlnSafe()
+				ui.PrintfSafe("%s> Retrieved web search results%s\n", types.ColorCyan, types.ColorReset)
+			} else if toolCall.Function.Name == "web_fetch" {
+				ui.PrintlnSafe()
+				ui.PrintfSafe("%s> Retrieved web page content%s\n", types.ColorCyan, types.ColorReset)
 			} else if toolCall.Function.Name == "list_files" {
 				ui.PrintlnSafe()
 				lineCount := strings.Count(result, "\n")

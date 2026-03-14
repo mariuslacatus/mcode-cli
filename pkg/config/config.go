@@ -78,7 +78,9 @@ func LoadOrCreateConfig(configPath string) (*types.Config, error) {
 				MaxCompletionTokens: 8192,
 			},
 		},
-		ApprovedFolders: []string{},
+		ApprovedFolders:    []string{},
+		WebSearchEnabled:   false,
+		ApprovedWebDomains: []string{},
 	}
 
 	// Save default config

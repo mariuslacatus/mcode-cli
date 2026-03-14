@@ -7,9 +7,11 @@ import (
 
 // Config represents the application configuration
 type Config struct {
-	CurrentModel    string           `json:"current_model"`
-	Models          map[string]Model `json:"models"`
-	ApprovedFolders []string         `json:"approved_folders"`
+	CurrentModel       string           `json:"current_model"`
+	Models             map[string]Model `json:"models"`
+	ApprovedFolders    []string         `json:"approved_folders"`
+	WebSearchEnabled   bool             `json:"web_search_enabled,omitempty"`
+	ApprovedWebDomains []string         `json:"approved_web_domains,omitempty"`
 }
 
 // Model represents an AI model configuration
@@ -43,6 +45,7 @@ type Agent struct {
 	Config              *Config
 	ConfigPath          string
 	ApprovedFolders     map[string]bool // Track folders user has granted access to
+	ApprovedWebDomains  map[string]bool // Track web domains user has granted access to
 	CurrentConvID       string          // ID of the currently active saved conversation
 	AutoApproveEdit     bool            // Auto-approve edit_file/write_file for current session
 	AutoApproveEditRoot string          // Limit auto-approved edits to the current folder subtree

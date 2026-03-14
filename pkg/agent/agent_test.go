@@ -104,3 +104,23 @@ func TestCanAutoApproveEditForFolder(t *testing.T) {
 		t.Fatal("expected sibling folder to be rejected")
 	}
 }
+
+func TestIsWebDomainApproved(t *testing.T) {
+	ag := &types.Agent{
+		ApprovedWebDomains: map[string]bool{
+			"example.com": true,
+		},
+	}
+
+	if !IsWebDomainApproved(ag, "example.com") {
+		t.Fatal("expected exact web domain to be approved")
+	}
+
+	if !IsWebDomainApproved(ag, "docs.example.com") {
+		t.Fatal("expected subdomain to be approved")
+	}
+
+	if IsWebDomainApproved(ag, "example.org") {
+		t.Fatal("expected unrelated domain to be rejected")
+	}
+}

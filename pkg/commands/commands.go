@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -235,36 +236,61 @@ func (h *Handler) switchModel(modelKey string) error {
 // handlePermissionsCommand handles /permissions command
 func (h *Handler) handlePermissionsCommand(parts []string) error {
 	if len(parts) == 1 {
-		// List approved folders
-		return h.listApprovedFolders()
+		return h.listPermissions()
 	}
 
 	if len(parts) == 3 && parts[1] == "remove" {
-		// Remove folder permission
 		return h.removeFolderPermission(parts[2])
 	}
 
+	if len(parts) == 3 && parts[1] == "remove-domain" {
+		return h.removeWebDomainPermission(parts[2])
+	}
+
+	if len(parts) == 2 && parts[1] == "disable-web-search" {
+		return h.disableWebSearchPermission()
+	}
+
 	fmt.Println("Usage:")
-	fmt.Println("  /permissions           - List approved folders")
-	fmt.Println("  /permissions remove <path> - Remove folder permission")
+	fmt.Println("  /permissions                    - List approved folder and web permissions")
+	fmt.Println("  /permissions remove <path>      - Remove folder permission")
+	fmt.Println("  /permissions remove-domain <d>  - Remove approved web domain")
+	fmt.Println("  /permissions disable-web-search - Disable saved web search permission")
 	return nil
 }
 
-// listApprovedFolders lists all approved folders
-func (h *Handler) listApprovedFolders() error {
+// listPermissions lists all saved tool permissions.
+func (h *Handler) listPermissions() error {
 	fmt.Println("\n🔒 Approved Folders")
 	fmt.Println("===================")
 
 	if len(h.agent.Config.ApprovedFolders) == 0 {
 		fmt.Println("No folders have been approved yet.")
+	} else {
+		for i, folder := range h.agent.Config.ApprovedFolders {
+			fmt.Printf("%d. %s\n", i+1, folder)
+		}
+
+		fmt.Printf("\nTotal: %d folder(s)\n", len(h.agent.Config.ApprovedFolders))
+	}
+
+	fmt.Println("\n🌐 Web Permissions")
+	fmt.Println("==================")
+	if h.agent.Config.WebSearchEnabled {
+		fmt.Println("Web search: enabled")
+	} else {
+		fmt.Println("Web search: disabled")
+	}
+
+	if len(h.agent.Config.ApprovedWebDomains) == 0 {
+		fmt.Println("Approved web domains: none")
 		return nil
 	}
 
-	for i, folder := range h.agent.Config.ApprovedFolders {
-		fmt.Printf("%d. %s\n", i+1, folder)
+	fmt.Println("Approved web domains:")
+	for i, domain := range h.agent.Config.ApprovedWebDomains {
+		fmt.Printf("%d. %s\n", i+1, domain)
 	}
-
-	fmt.Printf("\nTotal: %d folder(s)\n", len(h.agent.Config.ApprovedFolders))
 	return nil
 }
 
@@ -304,6 +330,71 @@ func (h *Handler) removeFolderPermission(folderPath string) error {
 	return nil
 }
 
+func (h *Handler) removeWebDomainPermission(domain string) error {
+	normalizedDomain := normalizeDomain(domain)
+	if normalizedDomain == "" {
+		return fmt.Errorf("invalid domain: %q", domain)
+	}
+
+	found := false
+	newApproved := make([]string, 0, len(h.agent.Config.ApprovedWebDomains))
+	for _, approvedDomain := range h.agent.Config.ApprovedWebDomains {
+		if normalizeDomain(approvedDomain) != normalizedDomain {
+			newApproved = append(newApproved, approvedDomain)
+		} else {
+			found = true
+		}
+	}
+
+	if !found {
+		fmt.Printf("❌ Web domain not found in approved list: %s\n", normalizedDomain)
+		return nil
+	}
+
+	h.agent.Config.ApprovedWebDomains = newApproved
+	delete(h.agent.ApprovedWebDomains, normalizedDomain)
+
+	if err := config.Save(h.agent.ConfigPath, h.agent.Config); err != nil {
+		return fmt.Errorf("failed to save config: %v", err)
+	}
+
+	fmt.Printf("✅ Removed web domain permission: %s\n", normalizedDomain)
+	return nil
+}
+
+func (h *Handler) disableWebSearchPermission() error {
+	if !h.agent.Config.WebSearchEnabled {
+		fmt.Println("Web search permission is already disabled.")
+		return nil
+	}
+
+	h.agent.Config.WebSearchEnabled = false
+	if err := config.Save(h.agent.ConfigPath, h.agent.Config); err != nil {
+		return fmt.Errorf("failed to save config: %v", err)
+	}
+
+	fmt.Println("✅ Disabled saved web search permission")
+	return nil
+}
+
+func normalizeDomain(domain string) string {
+	domain = strings.TrimSpace(strings.ToLower(domain))
+	domain = strings.TrimPrefix(domain, "*.")
+	domain = strings.TrimPrefix(domain, ".")
+	if idx := strings.Index(domain, "://"); idx >= 0 {
+		if parsedURL, err := url.Parse(domain); err == nil {
+			domain = parsedURL.Hostname()
+		}
+	}
+	if idx := strings.Index(domain, "/"); idx >= 0 {
+		domain = domain[:idx]
+	}
+	if idx := strings.Index(domain, ":"); idx >= 0 {
+		domain = domain[:idx]
+	}
+	return domain
+}
+
 // showHelp displays help information
 func (h *Handler) showHelp() {
 	fmt.Println("\n🤖 MCode CLI - Help")
@@ -315,7 +406,7 @@ func (h *Handler) showHelp() {
 	fmt.Println("  /export      - Export conversation context to text file")
 	fmt.Println("  /prompt      - List current system instructions/prompts")
 	fmt.Println("  /models      - List or switch between available models")
-	fmt.Println("  /permissions - Manage folder permissions")
+	fmt.Println("  /permissions - Manage folder and web permissions")
 	fmt.Println("  /compact     - Compact conversation context to save tokens")
 	fmt.Println("  /save        - Save current conversation to disk")
 	fmt.Println("  /resume      - List and resume saved conversations")
@@ -339,6 +430,8 @@ func (h *Handler) showHelp() {
 	fmt.Println("  ⚡ bash_command - Execute shell commands")
 	fmt.Println("  ✏️ edit_file    - Create/modify files (shows colored diffs)")
 	fmt.Println("  🔍 search_code  - Search for code patterns")
+	fmt.Println("  🌐 web_search   - Search the web for current external information")
+	fmt.Println("  🌍 web_fetch    - Fetch and read a specific web page")
 	fmt.Println()
 	fmt.Println("Usage:")
 	fmt.Println("  - Type natural language requests for coding tasks")
