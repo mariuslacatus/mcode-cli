@@ -8,19 +8,21 @@ import (
 
 // Response represents a standardized LLM response
 type Response struct {
-	Content      string
-	ToolCalls    []openai.ToolCall
-	Usage        *openai.Usage
-	FinishReason string
+	Content          string
+	ToolCalls        []openai.ToolCall
+	ThoughtSignature string
+	Usage            *openai.Usage
+	FinishReason     string
 }
 
 // StreamResponse represents a single chunk of a streaming response
 type StreamResponse struct {
-	Content      string
-	ToolCalls    []openai.ToolCall
-	Usage        *openai.Usage
-	FinishReason string
-	Error        error
+	Content          string
+	ToolCalls        []openai.ToolCall
+	ThoughtSignature string
+	Usage            *openai.Usage
+	FinishReason     string
+	Error            error
 }
 
 // Provider defines the interface for LLM services

@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"coding-agent/pkg/types"
+	"coding-agent/pkg/ui"
 
 	"github.com/mitchellh/mapstructure"
 	"github.com/sashabaranov/go-openai"
@@ -120,7 +121,7 @@ func (m *Manager) BashCommandBackground(params map[string]interface{}) string {
 		return "Error: command parameter is required"
 	}
 
-	fmt.Printf("%sStarting in background: %s%s\n", types.ColorYellow, args.Command, types.ColorReset)
+	ui.PrintfSafe("%sStarting in background: %s%s\n", types.ColorYellow, args.Command, types.ColorReset)
 
 	cmd := exec.Command("bash", "-c", args.Command)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

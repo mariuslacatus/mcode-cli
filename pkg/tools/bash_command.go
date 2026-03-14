@@ -5,12 +5,12 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"syscall"
 	"time"
 
 	"coding-agent/pkg/types"
+	"coding-agent/pkg/ui"
 	"github.com/sashabaranov/go-openai"
 )
 
@@ -55,15 +55,16 @@ func (t *BashCommandTool) Execute(params map[string]interface{}) (string, error)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	fmt.Printf("%sExecuting: %s%s\n", types.ColorYellow, args.Command, types.ColorReset)
-	fmt.Printf("%s(Press Ctrl+C to interrupt if it hangs)%s\n", types.ColorBlue, types.ColorReset)
+	ui.PrintfSafe("%sExecuting: %s%s\n", types.ColorYellow, args.Command, types.ColorReset)
+	ui.PrintfSafe("%s(Press Ctrl+C to interrupt if it hangs)%s\n", types.ColorBlue, types.ColorReset)
 
 	cmd := exec.CommandContext(ctx, "bash", "-c", args.Command)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	var stdoutBuf, stderrBuf bytes.Buffer
-	cmd.Stdout = io.MultiWriter(os.Stdout, &stdoutBuf)
-	cmd.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
+	safeWriter := ui.NewSafeOutputWriter()
+	cmd.Stdout = io.MultiWriter(safeWriter, &stdoutBuf)
+	cmd.Stderr = io.MultiWriter(safeWriter, &stderrBuf)
 
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("failed to start command: %v", err)

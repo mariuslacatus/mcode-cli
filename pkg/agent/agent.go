@@ -53,10 +53,7 @@ func New() *types.Agent {
 		}
 	}
 
-	// Configure OpenAI client
-	clientConfig := openai.DefaultConfig(currentModel.APIKey)
-	clientConfig.BaseURL = currentModel.BaseURL
-	client := openai.NewClientWithConfig(clientConfig)
+	provider := CreateProviderForModel(currentModel)
 
 	// Convert approved folders slice to map for faster lookup
 	approvedFolders := make(map[string]bool)
@@ -65,7 +62,7 @@ func New() *types.Agent {
 	}
 
 	agent := &types.Agent{
-		LLM:             llm.NewOpenAIProvider(client),
+		LLM:             provider,
 		Conversation:    []openai.ChatCompletionMessage{},
 		Tools:           make(map[string]func(map[string]interface{}) (string, error)),
 		Config:          cfg,
@@ -83,19 +80,39 @@ func New() *types.Agent {
 	return agent
 }
 
+// CreateProviderForModel creates the appropriate LLM provider for a model
+func CreateProviderForModel(model types.Model) llm.Provider {
+	if strings.Contains(strings.ToLower(model.Name), "gemini") {
+		return llm.NewGeminiCompatibleProvider(model.APIKey, model.BaseURL)
+	}
+
+	// Configure standard OpenAI client
+	clientConfig := openai.DefaultConfig(model.APIKey)
+	clientConfig.BaseURL = model.BaseURL
+	client := openai.NewClientWithConfig(clientConfig)
+	return llm.NewOpenAIProvider(client)
+}
+
+func normalizeToolName(name string) string {
+	if idx := strings.LastIndex(name, ":"); idx != -1 {
+		return name[idx+1:]
+	}
+	return name
+}
+
 // GetContextTokens returns the number of context tokens using tiktoken
 func GetContextTokens(a *types.Agent) int {
 	// If we have actual usage from the last API call, use it
 	if a.LastTokenUsage != nil && a.LastTokenUsage.PromptTokens > 0 {
 		return a.LastTokenUsage.PromptTokens
 	}
-	
+
 	// Otherwise estimate using tiktoken
 	modelName := a.Config.CurrentModel
 	if model, ok := a.Config.Models[modelName]; ok {
 		modelName = model.Name
 	}
-	
+
 	return tokens.CountMessagesTokens(modelName, a.Conversation)
 }
 
@@ -156,11 +173,11 @@ func RequestFolderPermission(a *types.Agent, folderPath string) bool {
 	ui.PauseInterruptMonitor()
 	response := ui.ReadConfirmation()
 	ui.ResumeInterruptMonitor()
-	
+
 	if response == "\r" || response == "\n" {
 		response = ""
 	}
-	
+
 	// Echo the choice
 	if response == "" {
 		ui.PrintlnSafe("y")
@@ -205,22 +222,22 @@ func TrimContext(a *types.Agent, messages []openai.ChatCompletionMessage) []open
 	// 2. The Current Task/User Message (~20%)
 	// 3. The Expected Completion (~20% or MaxCompletionTokens)
 	// 4. The History (The remainder, but capped for speed)
-	
+
 	totalLimit := currentModel.MaxTokens
 	if totalLimit <= 0 {
 		totalLimit = 8000 // Default fallback
 	}
 
-	// Budget is 50% of total context. 
+	// Budget is 50% of total context.
 	// This allows history to scale with the model (e.g. 64k history for 128k model)
 	// while still leaving 50% for system prompts, current code, and the output.
 	tokenBudget := int(float64(totalLimit) * 0.5)
-	
+
 	// Sane upper bound for memory safety (e.g. 100k tokens of history is huge)
 	if tokenBudget > 100000 {
 		tokenBudget = 100000
 	}
-	
+
 	var systemMessages []openai.ChatCompletionMessage
 	var otherMessages []openai.ChatCompletionMessage
 
@@ -235,12 +252,12 @@ func TrimContext(a *types.Agent, messages []openai.ChatCompletionMessage) []open
 	// Keep messages from the end until we hit the budget
 	var trimmed []openai.ChatCompletionMessage
 	currentTokens := 0
-	
+
 	for i := len(otherMessages) - 1; i >= 0; i-- {
 		msgTokens := tokens.CountMessagesTokens(currentModel.Name, []openai.ChatCompletionMessage{otherMessages[i]})
 		// Always keep at least 2 recent interactions (4 messages: 2 user, 2 assistant/tool)
 		if currentTokens+msgTokens > tokenBudget && len(trimmed) >= 4 {
-			break 
+			break
 		}
 		trimmed = append([]openai.ChatCompletionMessage{otherMessages[i]}, trimmed...)
 		currentTokens += msgTokens
@@ -387,7 +404,7 @@ func UpdateStatusDisplay(a *types.Agent) {
 // InitConversation initializes the conversation with system prompts
 func InitConversation(a *types.Agent) {
 	projectManager := project.NewManager(a)
-	
+
 	// Load AGENTS.md content for context
 	agentsContent := projectManager.LoadAgentsMD()
 
@@ -544,7 +561,7 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 
 				if strings.Contains(errStr, "context") || strings.Contains(errStr, "too long") ||
 					strings.Contains(errStr, "maximum") || a.LastTokenUsage != nil && a.LastTokenUsage.PromptTokens > 6000 {
-					
+
 					re := regexp.MustCompile(`context length is (\d+)`)
 					matches := re.FindStringSubmatch(errStr)
 					if len(matches) > 1 {
@@ -616,7 +633,7 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 				return fmt.Errorf("error calling API: %v", err)
 			}
 		}
-		
+
 		var previousLines []string
 		getTermHeight := func() int {
 			_, height, err := term.GetSize(int(os.Stdout.Fd()))
@@ -628,7 +645,7 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 
 		var fullContent strings.Builder
 		var toolCalls []openai.ToolCall
-		
+
 		genStartTime := time.Now()
 		contextTokens := GetContextTokens(a)
 
@@ -681,7 +698,7 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 			if response.FinishReason != "" {
 				finishReason = response.FinishReason
 			}
-			
+
 			// Ensure spinner is running for any generation signal
 			if response.Content != "" || len(response.ToolCalls) > 0 {
 				spinner.Start()
@@ -714,7 +731,7 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 					linesToBacktrack = termHeight - 1
 					diffIdx = len(previousLines) - linesToBacktrack
 					if diffIdx < 0 {
-						diffIdx = 0 
+						diffIdx = 0
 					}
 				}
 
@@ -810,7 +827,7 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 		spinner.Stop()
 
 		if finishReason == "length" {
-			fmt.Printf("\n⚠️  Warning: Generation truncated due to length limit!\n")
+			ui.PrintfSafe("\n⚠️  Warning: Generation truncated due to length limit!\n")
 		}
 
 		// Check if the response contains tool calls
@@ -827,7 +844,7 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 		}
 	}
 
-	fmt.Println()
+	ui.PrintlnSafe()
 
 	// Show token usage info
 	if a.LastTokenUsage != nil {
@@ -851,7 +868,7 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 // Local LLMs work much better with shorter, high-signal contexts.
 func TruncateForLLM(a *types.Agent, s string, maxChars int) string {
 	limit := 8000 // Default fallback
-	
+
 	// If model config is available, allow tool output to take up to ~50% of context
 	if model, ok := a.Config.Models[a.Config.CurrentModel]; ok && model.MaxTokens > 0 {
 		// Roughly 4 chars per token
@@ -861,12 +878,12 @@ func TruncateForLLM(a *types.Agent, s string, maxChars int) string {
 	if maxChars > 0 && maxChars < limit {
 		limit = maxChars
 	}
-	
+
 	// Sane upper bound for character count (e.g. 100k chars is plenty for one tool output)
 	if limit > 100000 {
 		limit = 100000
 	}
-	
+
 	if len(s) <= limit {
 		return s
 	}
@@ -892,28 +909,28 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 		var params map[string]interface{}
 		if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &params); err != nil {
 			spinner.Stop()
-			
+
 			errResult := ""
 			if truncated {
 				errResult = fmt.Sprintf("Error parsing tool parameters (Generation Truncated): %v", err)
 			} else {
 				errResult = fmt.Sprintf("Error parsing tool parameters: %v", err)
 			}
-			
+
 			if errResult == "" {
 				errResult = "Error parsing tool parameters"
 			}
 
-			fmt.Println(errResult)
+			ui.PrintlnSafe(errResult)
 			if len(toolCall.Function.Arguments) > 0 {
 				argLen := len(toolCall.Function.Arguments)
 				previewLen := 300
 				if argLen < previewLen {
 					previewLen = argLen
 				}
-				fmt.Printf("Partial JSON (len=%d): %s...\n", argLen, toolCall.Function.Arguments[:previewLen])
+				ui.PrintfSafe("Partial JSON (len=%d): %s...\n", argLen, toolCall.Function.Arguments[:previewLen])
 			}
-			
+
 			// Always add a tool response to avoid breaking the conversation
 			a.Conversation = append(a.Conversation, openai.ChatCompletionMessage{
 				Role:       openai.ChatMessageRoleTool,
@@ -923,16 +940,18 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 			continue
 		}
 
+		toolName := normalizeToolName(toolCall.Function.Name)
+
 		// Prepare tool display header
-		toolDisplay := fmt.Sprintf("🔧 %s%s%s", types.ColorCyan, toolCall.Function.Name, types.ColorReset)
-		displayInfo := toolManager.GetDisplayInfo(toolCall.Function.Name, params)
+		toolDisplay := fmt.Sprintf("🔧 %s%s%s", types.ColorCyan, toolName, types.ColorReset)
+		displayInfo := toolManager.GetDisplayInfo(toolName, params)
 		if displayInfo != "" {
 			toolDisplay += displayInfo
 		}
 
 		// Check for long-running and permissions
 		isLongRunning := false
-		if toolCall.Function.Name == "bash_command" {
+		if toolName == "bash_command" {
 			if cmdParam, exists := params["command"]; exists {
 				if cmdStr, ok := cmdParam.(string); ok {
 					isLongRunning = tools.IsLongRunningCommand(cmdStr)
@@ -942,11 +961,11 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 
 		shouldAutoExecute := false
 		var permissionError string
-		if toolCall.Function.Name == "list_files" || toolCall.Function.Name == "read_file" || toolCall.Function.Name == "preview_edit" || toolCall.Function.Name == "search_code" {
+		if toolName == "list_files" || toolName == "read_file" || toolName == "preview_edit" || toolName == "search_code" {
 			var folderPath string
 			if pathParam, exists := params["path"]; exists {
 				if pathStr, ok := pathParam.(string); ok {
-					if toolCall.Function.Name == "read_file" || toolCall.Function.Name == "preview_edit" {
+					if toolName == "read_file" || toolName == "preview_edit" {
 						folderPath = filepath.Dir(pathStr)
 					} else {
 						folderPath = pathStr
@@ -956,7 +975,7 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 				if dirStr, ok := dirParam.(string); ok {
 					folderPath = dirStr
 				}
-			} else if toolCall.Function.Name == "search_code" {
+			} else if toolName == "search_code" {
 				folderPath = "."
 			}
 
@@ -989,8 +1008,8 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 
 		// Get preview (potentially slow)
 		var preview string
-		if toolCall.Function.Name == "edit_file" || toolCall.Function.Name == "write_file" {
-			preview, _ = toolManager.GetPreview(toolCall.Function.Name, params)
+		if toolName == "edit_file" || toolName == "write_file" {
+			preview, _ = toolManager.GetPreview(toolName, params)
 		}
 
 		// NOW we are ready to show everything and prompt the user
@@ -1013,15 +1032,15 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 			}
 			playNotificationSound()
 			ui.PrintSafe(prompt)
-			
+
 			ui.PauseInterruptMonitor()
 			response = ui.ReadConfirmation()
 			ui.ResumeInterruptMonitor()
-			
+
 			if response == "\r" || response == "\n" {
 				response = "" // Treat Enter as default (yes)
 			}
-			
+
 			// Echo the choice since raw mode doesn't
 			if response == "" {
 				ui.PrintlnSafe("y")
@@ -1078,15 +1097,15 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 			// Always show errors in red
 			if strings.HasPrefix(result, "Error:") {
 				ui.PrintfSafe("\n%s> %s%s\n", types.ColorRed, result, types.ColorReset)
-			} else if toolCall.Function.Name == "edit_file" || toolCall.Function.Name == "write_file" {
+			} else if toolName == "edit_file" || toolName == "write_file" {
 				ui.PrintlnSafe() // Add blank line after tool call
 				// Only stream diff/output if it wasn't already shown in preview
 				if preview == "" {
 					streamOutput(result)
 				} else {
-					ui.PrintfSafe("✅ %s applied successfully\n\n", toolCall.Function.Name)
+					ui.PrintfSafe("✅ %s applied successfully\n\n", toolName)
 				}
-			} else if toolCall.Function.Name == "read_file" {
+			} else if toolName == "read_file" {
 				ui.PrintlnSafe() // Add blank line after tool call
 				offset := 0
 				if v, ok := params["offset"].(float64); ok {
@@ -1113,15 +1132,15 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 				} else {
 					ui.PrintfSafe("%s> Read 0 lines (empty or at end of file)%s\n", types.ColorCyan, types.ColorReset)
 				}
-			} else if toolCall.Function.Name == "search_code" {
+			} else if toolName == "search_code" {
 				ui.PrintlnSafe() // Add blank line after tool call
 				lineCount := strings.Count(result, "\n")
 				ui.PrintfSafe("%s> Found %d matches%s\n", types.ColorCyan, lineCount, types.ColorReset)
-			} else if toolCall.Function.Name == "list_files" {
+			} else if toolName == "list_files" {
 				ui.PrintlnSafe() // Add blank line after tool call
 				lineCount := strings.Count(result, "\n")
 				ui.PrintfSafe("%s> Listed %d items%s\n", types.ColorCyan, lineCount, types.ColorReset)
-			} else if toolCall.Function.Name != "read_file" && toolCall.Function.Name != "list_files" && toolCall.Function.Name != "bash_command" {
+			} else if toolName != "read_file" && toolName != "list_files" && toolName != "bash_command" {
 				ui.PrintlnSafe() // Add blank line after tool call
 				// Generic output display (skip read_file, list_files and bash_command to avoid clutter/duplication)
 				ui.PrintfSafe("%s> Tool Output:%s\n", types.ColorCyan, types.ColorReset)
@@ -1172,12 +1191,13 @@ func playNotificationSound() {
 	}()
 
 	// Always show ASCII bell (for taskbar notification)
-	fmt.Print("\a")
+	ui.PrintSafe("\a")
 }
 
 // executeToolBasedOnResponse executes a tool based on user response
 func executeToolBasedOnResponse(ctx context.Context, a *types.Agent, response string, toolCall openai.ToolCall, params map[string]interface{}, isLongRunning bool, toolManager *tools.Manager) (string, bool, error) {
 	var result string
+	toolName := normalizeToolName(toolCall.Function.Name)
 
 	if response == "i" {
 		return "", false, ui.ErrInterrupted
@@ -1185,13 +1205,13 @@ func executeToolBasedOnResponse(ctx context.Context, a *types.Agent, response st
 
 	if response == "" || response == "y" || response == "yes" {
 		// Execute the tool
-		toolFunc, exists := a.Tools[toolCall.Function.Name]
+		toolFunc, exists := a.Tools[toolName]
 		if !exists {
-			fmt.Printf("Unknown tool: %s\n", toolCall.Function.Name)
+			ui.PrintfSafe("Unknown tool: %s\n", toolCall.Function.Name)
 			result = "Error: Unknown tool"
 		} else {
 			// Start spinner for tool execution
-			spinner := ui.NewSpinner(fmt.Sprintf("Executing %s...", toolCall.Function.Name))
+			spinner := ui.NewSpinner(fmt.Sprintf("Executing %s...", toolName))
 			spinner.Start()
 
 			// Tool execution doesn't support context yet, so we just run it
@@ -1212,19 +1232,19 @@ func executeToolBasedOnResponse(ctx context.Context, a *types.Agent, response st
 		}
 	} else if response == "s" || response == "skip" {
 		result = "Tool execution skipped by user"
-		fmt.Printf("⏭️  Tool execution skipped\n")
+		ui.PrintfSafe("⏭️  Tool execution skipped\n")
 	} else if response == "b" || response == "background" {
 		if isLongRunning {
-			fmt.Printf("🚀 Starting command in background...\n")
+			ui.PrintfSafe("🚀 Starting command in background...\n")
 			result = toolManager.BashCommandBackground(params)
-			fmt.Printf("✅ Command started in background\n")
+			ui.PrintfSafe("✅ Command started in background\n")
 		} else {
 			result = "Background execution only available for long-running commands"
-			fmt.Printf("⚠️  Background execution only available for long-running commands\n")
+			ui.PrintfSafe("⚠️  Background execution only available for long-running commands\n")
 		}
 	} else {
 		result = "Tool execution denied by user"
-		fmt.Printf("❌ Tool execution denied\n")
+		ui.PrintfSafe("❌ Tool execution denied\n")
 	}
 
 	return result, true, nil

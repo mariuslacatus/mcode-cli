@@ -10,7 +10,6 @@ import (
 	"coding-agent/pkg/agent"
 	"coding-agent/pkg/config"
 	"coding-agent/pkg/conversation"
-	"coding-agent/pkg/llm"
 	"coding-agent/pkg/markdown"
 	"coding-agent/pkg/project"
 	"coding-agent/pkg/types"
@@ -201,9 +200,7 @@ func (h *Handler) switchModel(modelKey string) error {
 	}
 
 	// Update client
-	clientConfig := openai.DefaultConfig(model.APIKey)
-	clientConfig.BaseURL = model.BaseURL
-	h.agent.LLM = llm.NewOpenAIProvider(openai.NewClientWithConfig(clientConfig))
+	h.agent.LLM = agent.CreateProviderForModel(model)
 
 	fmt.Printf("✅ Switched to model: %s\n", modelKey)
 	fmt.Printf("📱 Name: %s\n", model.Name)

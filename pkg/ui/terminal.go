@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -19,7 +20,7 @@ var (
 	rawModeMu sync.Mutex
 	oldState  *term.State
 	outputMu  sync.Mutex
-	
+
 	// ErrInterrupted is returned when the user presses Escape or Ctrl+C
 	ErrInterrupted = fmt.Errorf("interrupted by user")
 )
@@ -58,7 +59,7 @@ func StartInterruptMonitor(ctx context.Context) (context.Context, func()) {
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		
+
 		buf := make([]byte, 1)
 		for {
 			select {
@@ -103,10 +104,10 @@ func StartInterruptMonitor(ctx context.Context) (context.Context, func()) {
 	return ctx, func() {
 		cancel()
 		wg.Wait()
-		
+
 		rawModeMu.Lock()
 		defer rawModeMu.Unlock()
-		
+
 		// Only restore if we were the ones who set it and it's still set
 		if !alreadyRaw && isRawMode.Load() && oldState != nil {
 			term.Restore(fd, oldState)
@@ -127,9 +128,9 @@ func inputAvailableTimeout(fd int, usec int) bool {
 	var fds unix.FdSet
 	// Set bit for fd
 	fds.Bits[fd/32] |= 1 << (uint(fd) % 32)
-	
+
 	tv := unix.Timeval{Sec: 0, Usec: int32(usec)}
-	
+
 	n, err := unix.Select(fd+1, &fds, nil, nil, &tv)
 	return n > 0 && err == nil
 }
@@ -172,25 +173,38 @@ func PrintfSafe(format string, a ...interface{}) {
 	os.Stdout.Sync()
 }
 
+type safeOutputWriter struct{}
+
+// NewSafeOutputWriter returns an io.Writer that routes terminal output through
+// the same raw-mode-safe path used by PrintSafe.
+func NewSafeOutputWriter() io.Writer {
+	return safeOutputWriter{}
+}
+
+func (safeOutputWriter) Write(p []byte) (int, error) {
+	PrintSafe(string(p))
+	return len(p), nil
+}
+
 // ReadConfirmation reads a single key for confirmation.
 // Returns the string representation (e.g., "y", "n", "i") or "i" if Escape.
 func ReadConfirmation() string {
 	fd := int(os.Stdin.Fd())
-	
+
 	// Set raw mode temporarily
 	state, err := term.MakeRaw(fd)
 	if err != nil {
 		return ""
 	}
 	defer term.Restore(fd, state)
-	
+
 	buf := make([]byte, 1)
 	for {
 		n, err := os.Stdin.Read(buf)
 		if err != nil || n == 0 {
 			return ""
 		}
-		
+
 		key := buf[0]
 		if key == 27 { // Escape
 			// Check if it's a sequence
@@ -206,7 +220,7 @@ func ReadConfirmation() string {
 		if key == 3 { // Ctrl+C
 			return "i"
 		}
-		
+
 		// Map other keys
 		return strings.ToLower(string(key))
 	}

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -25,8 +26,8 @@ func TestTrimContext(t *testing.T) {
 
 	// Create a conversation that definitely exceeds 500 tokens
 	// 1000 'hello ' strings will be ~1000-2000 tokens depending on tokenizer
-	longText := strings.Repeat("hello world ", 500) 
-	
+	longText := strings.Repeat("hello world ", 500)
+
 	messages := []openai.ChatCompletionMessage{
 		{Role: openai.ChatMessageRoleSystem, Content: "System prompt"},
 		{Role: openai.ChatMessageRoleUser, Content: "Message 1 " + longText},
@@ -75,11 +76,51 @@ func TestTruncateForLLM(t *testing.T) {
 	hugeText := strings.Repeat("a", 10000)
 	truncated := TruncateForLLM(ag, hugeText, 0)
 
-	if len(truncated) > 3000 { 
+	if len(truncated) > 3000 {
 		t.Errorf("TruncateForLLM failed to respect model-based limit: got len %d", len(truncated))
 	}
 
 	if !strings.Contains(truncated, "Output truncated") {
 		t.Error("Truncation message missing")
+	}
+}
+
+func TestExecuteToolBasedOnResponseNormalizesToolName(t *testing.T) {
+	called := false
+	ag := &types.Agent{
+		Tools: map[string]func(map[string]interface{}) (string, error){
+			"read_file": func(params map[string]interface{}) (string, error) {
+				called = true
+				return "ok", nil
+			},
+		},
+	}
+
+	toolCall := openai.ToolCall{
+		Function: openai.FunctionCall{
+			Name: "default_api:read_file",
+		},
+	}
+
+	result, shouldContinue, err := executeToolBasedOnResponse(
+		context.Background(),
+		ag,
+		"y",
+		toolCall,
+		map[string]interface{}{"path": "/tmp/test.txt"},
+		false,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("executeToolBasedOnResponse returned error: %v", err)
+	}
+	if !shouldContinue {
+		t.Fatal("executeToolBasedOnResponse unexpectedly stopped processing")
+	}
+	if !called {
+		t.Fatal("normalized tool name was not used for tool execution")
+	}
+	if result != "ok" {
+		t.Fatalf("unexpected tool result: %q", result)
 	}
 }
