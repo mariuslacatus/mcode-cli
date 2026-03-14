@@ -193,22 +193,63 @@ func IsFolderApproved(a *types.Agent, folderPath string) bool {
 	return false
 }
 
+func isPathWithinRoot(path, root string) bool {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+
+	if absPath == absRoot {
+		return true
+	}
+
+	rel, err := filepath.Rel(absRoot, absPath)
+	if err != nil {
+		return false
+	}
+
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+func canAutoApproveEditForFolder(a *types.Agent, folderPath string) bool {
+	if !a.AutoApproveEdit || a.AutoApproveEditRoot == "" {
+		return false
+	}
+
+	return isPathWithinRoot(folderPath, a.AutoApproveEditRoot)
+}
+
+func setAutoApproveEditScope(a *types.Agent, folderPath string) {
+	a.AutoApproveEdit = true
+	a.AutoApproveEditRoot = folderPath
+}
+
+func clearAutoApproveEditScope(a *types.Agent) {
+	a.AutoApproveEdit = false
+	a.AutoApproveEditRoot = ""
+}
+
 // RequestFolderPermission requests permission for folder access
-func RequestFolderPermission(a *types.Agent, folderPath string) bool {
+func RequestFolderPermission(a *types.Agent, folderPath string) (bool, error) {
 	// Normalize the path
 	absPath, err := filepath.Abs(folderPath)
 	if err != nil {
 		ui.PrintfSafe("Error resolving path: %v\n", err)
-		return false
+		return false, nil
 	}
 
 	// Check if already approved (including parent folder check)
 	if IsFolderApproved(a, folderPath) {
-		return true
+		return true, nil
 	}
 
 	ui.PrintfSafe("🔒 Request folder access: %s\n", absPath)
-	ui.PrintSafe("❓ Allow list_files and read_file operations in this folder and all subfolders? (Y/n): ")
+	ui.PrintSafe("❓ Allow tool access in this folder and all subfolders? This includes read, search, preview, and approved edits. (Y/n/Esc to cancel): ")
 
 	// Play notification sound
 	playNotificationSound()
@@ -224,6 +265,9 @@ func RequestFolderPermission(a *types.Agent, folderPath string) bool {
 	// Echo the choice
 	if response == "" {
 		ui.PrintlnSafe("y")
+	} else if response == "i" {
+		ui.PrintlnSafe("cancel")
+		return false, ui.ErrInterrupted
 	} else {
 		ui.PrintlnSafe(response)
 	}
@@ -238,11 +282,11 @@ func RequestFolderPermission(a *types.Agent, folderPath string) bool {
 		}
 
 		ui.PrintfSafe("✅ Folder access granted: %s (includes all subfolders)\n", absPath)
-		return true
+		return true, nil
 	}
 
 	ui.PrintfSafe("❌ Folder access denied\n")
-	return false
+	return false, nil
 }
 
 // TrimContext reduces conversation history to stay within a token budget.
@@ -411,7 +455,7 @@ func UpdateStatusDisplay(a *types.Agent) {
 	if model, exists := a.Config.Models[a.Config.CurrentModel]; exists {
 		modelName = model.Name
 	}
-	ui.UpdateStatusDisplay(modelName, tokens)
+	ui.UpdateStatusDisplay(modelName, tokens, a.AutoApproveEdit)
 }
 
 // InitConversation initializes the conversation with system prompts
@@ -475,7 +519,18 @@ func Chat(a *types.Agent, ctx context.Context, message string) error {
 
 	renderer, _ := markdown.NewNoMarginTermRenderer()
 
-	sessionCtx, cancelSession := ui.StartInterruptMonitor(ctx)
+	sessionCtx, cancelSession := ui.StartInterruptMonitor(ctx, func() {
+		if a.AutoApproveEdit {
+			clearAutoApproveEditScope(a)
+		} else {
+			setAutoApproveEditScope(a, ".")
+		}
+		status := "Off"
+		if a.AutoApproveEdit {
+			status = "On"
+		}
+		ui.PrintfSafe("\r\n%s[Auto-approve edits: %s]%s\r\n", types.ColorCyan, status, types.ColorReset)
+	})
 	defer cancelSession()
 
 	for {
@@ -949,11 +1004,20 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 
 		shouldAutoExecute := false
 		var permissionError string
-		if toolCall.Function.Name == "list_files" || toolCall.Function.Name == "read_file" || toolCall.Function.Name == "preview_edit" || toolCall.Function.Name == "search_code" {
-			var folderPath string
-			if pathParam, exists := params["path"]; exists {
-				if pathStr, ok := pathParam.(string); ok {
-					if toolCall.Function.Name == "read_file" || toolCall.Function.Name == "preview_edit" {
+		var folderPath string
+
+		isEditTool := toolCall.Function.Name == "edit_file" || toolCall.Function.Name == "write_file"
+
+		if toolCall.Function.Name == "list_files" || toolCall.Function.Name == "read_file" || toolCall.Function.Name == "preview_edit" || toolCall.Function.Name == "search_code" || toolCall.Function.Name == "edit_file" || toolCall.Function.Name == "write_file" {
+			// Try "path" first, then "filePath"
+			pathVal := params["path"]
+			if pathVal == nil {
+				pathVal = params["filePath"]
+			}
+
+			if pathVal != nil {
+				if pathStr, ok := pathVal.(string); ok {
+					if toolCall.Function.Name == "read_file" || toolCall.Function.Name == "preview_edit" || toolCall.Function.Name == "edit_file" || toolCall.Function.Name == "write_file" {
 						folderPath = filepath.Dir(pathStr)
 					} else {
 						folderPath = pathStr
@@ -969,13 +1033,41 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 
 			if folderPath != "" {
 				if IsFolderApproved(a, folderPath) {
-					shouldAutoExecute = true
+					if toolCall.Function.Name == "list_files" || toolCall.Function.Name == "read_file" || toolCall.Function.Name == "preview_edit" || toolCall.Function.Name == "search_code" {
+						shouldAutoExecute = true
+					} else if isEditTool && canAutoApproveEditForFolder(a, folderPath) {
+						shouldAutoExecute = true
+					}
 				} else {
 					spinner.Stop()
-					if !RequestFolderPermission(a, folderPath) {
+					approved, err := RequestFolderPermission(a, folderPath)
+					if err == ui.ErrInterrupted {
+						// Interrupted by user, skip tool call
+						found := false
+						for _, tc := range toolCalls {
+							if found {
+								a.Conversation = append(a.Conversation, types.Message{
+									Role:       openai.ChatMessageRoleTool,
+									Content:    "Tool call skipped due to user interruption",
+									ToolCallID: tc.ID,
+								})
+							}
+							if tc.ID == toolCall.ID {
+								found = true
+							}
+						}
+						return err
+					}
+
+					if !approved {
 						permissionError = "Permission denied for folder access"
 					} else {
-						shouldAutoExecute = true
+						// Folder was just approved. We auto-execute read-only tools.
+						if toolCall.Function.Name == "list_files" || toolCall.Function.Name == "read_file" || toolCall.Function.Name == "preview_edit" || toolCall.Function.Name == "search_code" {
+							shouldAutoExecute = true
+						} else if isEditTool && canAutoApproveEditForFolder(a, folderPath) {
+							shouldAutoExecute = true
+						}
 						spinner.Start()
 					}
 				}
@@ -1013,6 +1105,12 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 			if isLongRunning {
 				ui.PrintfSafe("%s⚠️  This looks like a long-running command!%s\n", types.ColorYellow, types.ColorReset)
 				prompt = "\n❓ Execute this tool? (Y/n/s to skip/Esc to cancel/b for background): "
+			} else if isEditTool {
+				autoApproveStatus := "Off"
+				if a.AutoApproveEdit {
+					autoApproveStatus = "On"
+				}
+				prompt = fmt.Sprintf("\n❓ Execute this tool? (Y/n/s to skip/Esc to cancel/⇥/Ctrl+T Auto-approve edits [%s]): ", autoApproveStatus)
 			}
 			playNotificationSound()
 			ui.PrintSafe(prompt)
@@ -1021,6 +1119,46 @@ func handleToolCalls(ctx context.Context, a *types.Agent, toolCalls []openai.Too
 			response = ui.ReadConfirmation()
 			ui.ResumeInterruptMonitor()
 
+			// Handle toggle (Shift+Tab/Ctrl+T)
+			for response == "t" {
+				if a.AutoApproveEdit {
+					clearAutoApproveEditScope(a)
+				} else if isEditTool && folderPath != "" {
+					setAutoApproveEditScope(a, folderPath)
+				} else {
+					setAutoApproveEditScope(a, ".")
+				}
+				autoApproveStatus := "Off"
+				if a.AutoApproveEdit {
+					autoApproveStatus = "On"
+				}
+
+				// Clear the line and go back to start
+				ui.PrintSafe("\r\033[K")
+
+				// Re-create the prompt text so it includes the updated status if it's an edit tool
+				if isEditTool {
+					prompt = fmt.Sprintf("\n❓ Execute this tool? (Y/n/s to skip/Esc to cancel/⇥/Ctrl+T Auto-approve edits [%s]): ", autoApproveStatus)
+					// We use \033[A to move cursor up one line, clear it, print status, then print prompt
+					ui.PrintSafe("\033[A\r\033[K")
+					ui.PrintfSafe("%s[Auto-approve edits: %s]%s", types.ColorCyan, autoApproveStatus, types.ColorReset)
+					ui.PrintSafe(prompt)
+
+					// If they toggled it on for the current folder, proceed with this edit.
+					if canAutoApproveEditForFolder(a, folderPath) {
+						ui.PrintlnSafe("y")
+						response = "y"
+						break
+					}
+				} else {
+					ui.PrintfSafe("%s[Auto-approve edits: %s]%s", types.ColorCyan, autoApproveStatus, types.ColorReset)
+					ui.PrintSafe(prompt)
+				}
+
+				ui.PauseInterruptMonitor()
+				response = ui.ReadConfirmation()
+				ui.ResumeInterruptMonitor()
+			}
 			if response == "\r" || response == "\n" {
 				response = ""
 			}
@@ -1172,7 +1310,7 @@ func executeToolBasedOnResponse(ctx context.Context, a *types.Agent, response st
 	}
 
 	if response == "" || response == "y" || response == "yes" {
-		toolFunc, exists := a.Tools[toolCall.Function.Name]
+		tool, exists := toolManager.GetTool(toolCall.Function.Name)
 		if !exists {
 			fmt.Printf("Unknown tool: %s\n", toolCall.Function.Name)
 			result = "Error: Unknown tool"
@@ -1181,7 +1319,7 @@ func executeToolBasedOnResponse(ctx context.Context, a *types.Agent, response st
 			spinner.Start()
 
 			var err error
-			result, err = toolFunc(params)
+			result, err = tool.Execute(ctx, params)
 			spinner.Stop()
 
 			if ctx.Err() != nil {

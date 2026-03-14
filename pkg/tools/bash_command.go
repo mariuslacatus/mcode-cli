@@ -5,14 +5,28 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
+	"sync"
 	"syscall"
-	"time"
 
 	"coding-agent/pkg/types"
+	"coding-agent/pkg/ui"
 	"github.com/sashabaranov/go-openai"
 )
+
+// safeWriter wraps output with proper newline handling for raw mode
+type safeWriter struct {
+	once sync.Once
+}
+
+func (sw *safeWriter) Write(p []byte) (n int, err error) {
+	sw.once.Do(func() {
+		// Print a newline before first output to separate from the "Executing:" line
+		ui.PrintSafe("\n")
+	})
+	ui.PrintSafe(string(p))
+	return len(p), nil
+}
 
 type BashCommandTool struct {
 	BaseTool
@@ -41,8 +55,7 @@ func (t *BashCommandTool) Definition() openai.Tool {
 		},
 	}
 }
-
-func (t *BashCommandTool) Execute(params map[string]interface{}) (string, error) {
+func (t *BashCommandTool) Execute(ctx context.Context, params map[string]interface{}) (string, error) {
 	var args BashCommandArgs
 	if err := t.Unmarshal(params, &args); err != nil {
 		return "", err
@@ -52,18 +65,18 @@ func (t *BashCommandTool) Execute(params map[string]interface{}) (string, error)
 		return "", fmt.Errorf("command parameter is required")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	fmt.Printf("%sExecuting: %s%s\n", types.ColorYellow, args.Command, types.ColorReset)
-	fmt.Printf("%s(Press Ctrl+C to interrupt if it hangs)%s\n", types.ColorBlue, types.ColorReset)
+	// Use provided context which handles cancellation
+	ui.PrintfSafe("%sExecuting: %s%s\n", types.ColorYellow, args.Command, types.ColorReset)
+	ui.PrintfSafe("%s(Press Ctrl+C/Esc to interrupt if it hangs)%s\n", types.ColorBlue, types.ColorReset)
 
 	cmd := exec.CommandContext(ctx, "bash", "-c", args.Command)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	var stdoutBuf, stderrBuf bytes.Buffer
-	cmd.Stdout = io.MultiWriter(os.Stdout, &stdoutBuf)
-	cmd.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
+	safeOut := &safeWriter{}
+	safeErr := &safeWriter{}
+	cmd.Stdout = io.MultiWriter(safeOut, &stdoutBuf)
+	cmd.Stderr = io.MultiWriter(safeErr, &stderrBuf)
 
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("failed to start command: %v", err)

@@ -3,6 +3,7 @@ package tokens
 import (
 	"testing"
 
+	"coding-agent/pkg/types"
 	"github.com/sashabaranov/go-openai"
 )
 
@@ -44,7 +45,7 @@ func TestCountTokens(t *testing.T) {
 }
 
 func TestCountMessagesTokens(t *testing.T) {
-	messages := []openai.ChatCompletionMessage{
+	messages := []types.Message{
 		{
 			Role:    openai.ChatMessageRoleSystem,
 			Content: "You are a helpful assistant.",

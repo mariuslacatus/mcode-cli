@@ -35,8 +35,9 @@ func ResumeInterruptMonitor() {
 }
 
 // StartInterruptMonitor puts terminal in raw mode and cancels context on Escape.
+// It also accepts an optional onToggle callback to handle toggling modes like auto-approve.
 // Returns a derived context and a restore function.
-func StartInterruptMonitor(ctx context.Context) (context.Context, func()) {
+func StartInterruptMonitor(ctx context.Context, onToggle func()) (context.Context, func()) {
 	ctx, cancel := context.WithCancel(ctx)
 
 	rawModeMu.Lock()
@@ -82,15 +83,33 @@ func StartInterruptMonitor(ctx context.Context) (context.Context, func()) {
 							if !inputAvailableShort(fd) {
 								return
 							}
-							// Otherwise, it's an escape sequence, consume it
+							// Otherwise, check if it's an escape sequence for Shift+Tab
+							n, err := os.Stdin.Read(buf)
+							if err == nil && n > 0 && buf[0] == 91 { // '['
+								if inputAvailableShort(fd) {
+									n, err := os.Stdin.Read(buf)
+									if err == nil && n > 0 && buf[0] == 90 { // 'Z' -> Shift+Tab
+										if onToggle != nil {
+											onToggle()
+										}
+										continue
+									}
+								}
+							}
+							// Not Shift+Tab, consume remaining sequence
 							for inputAvailableShort(fd) {
 								os.Stdin.Read(buf)
 							}
 							continue
 						}
-						// Also handle Ctrl+C (ETX)
+						// Handle Ctrl+C (ETX)
 						if buf[0] == 3 {
 							return
+						}
+						// Handle Ctrl+T (20) for toggling
+						if buf[0] == 20 && onToggle != nil {
+							onToggle()
+							continue
 						}
 					}
 				}
@@ -120,7 +139,7 @@ func inputAvailable(fd int) bool {
 }
 
 func inputAvailableShort(fd int) bool {
-	return inputAvailableTimeout(fd, 10000) // 10ms
+	return inputAvailableTimeout(fd, 50000) // 50ms
 }
 
 func inputAvailableTimeout(fd int, usec int) bool {
@@ -173,7 +192,12 @@ func PrintfSafe(format string, a ...interface{}) {
 }
 
 // ReadConfirmation reads a single key for confirmation.
-// Returns the string representation (e.g., "y", "n", "i") or "i" if Escape.
+// Returns:
+//   - "y" for yes
+//   - "n" for no
+//   - "i" for interrupt/escape
+//   - "t" for Shift+Tab (toggle)
+//   - "s" for skip
 func ReadConfirmation() string {
 	fd := int(os.Stdin.Fd())
 
@@ -195,16 +219,41 @@ func ReadConfirmation() string {
 		if key == 27 { // Escape
 			// Check if it's a sequence
 			if inputAvailableShort(fd) {
-				// Read and discard the rest of the sequence
+				// Read next character to determine the sequence
+				n, err := os.Stdin.Read(buf)
+				if err != nil || n == 0 {
+					return ""
+				}
+				if buf[0] == 91 { // '['
+					// Check for Shift+Tab (sequence: 27, 91, 90 = ESC [ Z)
+					if inputAvailableShort(fd) {
+						n, err := os.Stdin.Read(buf)
+						if err != nil || n == 0 {
+							return ""
+						}
+						if buf[0] == 90 { // 'Z'
+							return "t" // Shift+Tab = toggle
+						}
+						// Unknown sequence, discard remaining
+						for inputAvailableShort(fd) {
+							os.Stdin.Read(buf)
+						}
+						continue
+					}
+				}
+				// Unknown escape sequence, discard remaining
 				for inputAvailableShort(fd) {
 					os.Stdin.Read(buf)
 				}
-				continue // Ignore sequence and wait for another key
+				continue
 			}
 			return "i" // Standalone Escape -> interrupt
 		}
 		if key == 3 { // Ctrl+C
 			return "i"
+		}
+		if key == 20 { // Ctrl+T
+			return "t"
 		}
 
 		// Map other keys
@@ -213,15 +262,21 @@ func ReadConfirmation() string {
 }
 
 // UpdateStatusDisplay updates the fixed header at the top of the terminal
-func UpdateStatusDisplay(modelName string, tokens int) {
+func UpdateStatusDisplay(modelName string, tokens int, autoApproveEdit bool) {
 	// Format token string
 	usageStr := fmt.Sprintf("%d", tokens)
 	if tokens >= 1000 {
 		usageStr = fmt.Sprintf("%.1fk", float64(tokens)/1000.0)
 	}
 
+	// Build status string
+	autoApproveStr := ""
+	if autoApproveEdit {
+		autoApproveStr = " | 🔓 Auto-approve"
+	}
+
 	// Update window title using ANSI escape sequence: \033]0;TITLE\007
 	// This shows status in the terminal tab/window title instead of a sticky header
-	title := fmt.Sprintf("MCode | %s | %s tokens", modelName, usageStr)
+	title := fmt.Sprintf("MCode | %s | %s tokens%s", modelName, usageStr, autoApproveStr)
 	fmt.Printf("\033]0;%s\007", title)
 }

@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,7 +38,7 @@ func (t *ListFilesTool) Definition() openai.Tool {
 	}
 }
 
-func (t *ListFilesTool) Execute(params map[string]interface{}) (string, error) {
+func (t *ListFilesTool) Execute(ctx context.Context, params map[string]interface{}) (string, error) {
 	var args ListFilesArgs
 	if err := t.Unmarshal(params, &args); err != nil {
 		return "", err
@@ -48,17 +49,29 @@ func (t *ListFilesTool) Execute(params map[string]interface{}) (string, error) {
 		path = "."
 	}
 
-	entries, err := os.ReadDir(path)
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+
+	dir, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("error listing directory: %v", err)
+		return "", fmt.Errorf("failed to open directory: %v", err)
+	}
+	defer dir.Close()
+
+	const maxItems = 100
+	entries, err := dir.ReadDir(maxItems + 1)
+	if err != nil {
+		return "", fmt.Errorf("failed to read directory: %v", err)
 	}
 
 	var files []string
-	count := 0
-	const maxItems = 100
 
-	for _, entry := range entries {
-		if count >= maxItems {
+	for i, entry := range entries {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		if i >= maxItems {
 			files = append(files, fmt.Sprintf("\n[... Truncated: only first %d items shown ...]", maxItems))
 			break
 		}
@@ -67,7 +80,6 @@ func (t *ListFilesTool) Execute(params map[string]interface{}) (string, error) {
 		} else {
 			files = append(files, entry.Name())
 		}
-		count++
 	}
 
 	return strings.Join(files, "\n"), nil

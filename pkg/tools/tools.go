@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -61,7 +62,9 @@ func (m *Manager) RegisterTools() {
 
 	// Maintain the old map for now to avoid breaking types.Agent if it's used elsewhere
 	for name, tool := range m.tools {
-		m.agent.Tools[name] = tool.Execute
+		m.agent.Tools[name] = func(params map[string]interface{}) (string, error) {
+			return tool.Execute(context.Background(), params)
+		}
 	}
 }
 
@@ -82,6 +85,12 @@ func (m *Manager) addTool(tool Tool) {
 		t.manager = m
 	}
 	m.tools[tool.Name()] = tool
+}
+
+// GetTool returns a tool by name
+func (m *Manager) GetTool(name string) (Tool, bool) {
+	tool, ok := m.tools[name]
+	return tool, ok
 }
 
 // GetToolDefinitions returns OpenAI tool definitions

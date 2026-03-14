@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -40,7 +41,7 @@ func (t *WriteFileTool) Definition() openai.Tool {
 	}
 }
 
-func (t *WriteFileTool) Execute(params map[string]interface{}) (string, error) {
+func (t *WriteFileTool) Execute(ctx context.Context, params map[string]interface{}) (string, error) {
 	var args WriteFileArgs
 	if err := t.Unmarshal(params, &args); err != nil {
 		return "", err
@@ -50,10 +51,18 @@ func (t *WriteFileTool) Execute(params map[string]interface{}) (string, error) {
 		return "", fmt.Errorf("path parameter is required")
 	}
 
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+
 	// Ensure parent directories exist
 	dir := filepath.Dir(args.Path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", fmt.Errorf("error creating directories: %v", err)
+	}
+
+	if ctx.Err() != nil {
+		return "", ctx.Err()
 	}
 
 	var oldContent string
@@ -65,9 +74,17 @@ func (t *WriteFileTool) Execute(params map[string]interface{}) (string, error) {
 		oldContent = string(existingContent)
 	}
 
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+
 	err := os.WriteFile(args.Path, []byte(args.Content), 0644)
 	if err != nil {
 		return "", fmt.Errorf("error writing file: %v", err)
+	}
+
+	if ctx.Err() != nil {
+		return "", ctx.Err()
 	}
 
 	if oldContent == "" {

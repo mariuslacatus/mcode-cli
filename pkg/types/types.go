@@ -35,15 +35,17 @@ type Message struct {
 
 // Agent represents the AI agent with its state
 type Agent struct {
-	LLM             llm.Provider
-	Conversation    []Message
-	Tools           map[string]func(map[string]interface{}) (string, error)
-	LastTokenUsage  *openai.Usage
-	TotalTokensUsed int
-	Config          *Config
-	ConfigPath      string
-	ApprovedFolders map[string]bool // Track folders user has granted access to
-	CurrentConvID   string          // ID of the currently active saved conversation
+	LLM                 llm.Provider
+	Conversation        []Message
+	Tools               map[string]func(map[string]interface{}) (string, error)
+	LastTokenUsage      *openai.Usage
+	TotalTokensUsed     int
+	Config              *Config
+	ConfigPath          string
+	ApprovedFolders     map[string]bool // Track folders user has granted access to
+	CurrentConvID       string          // ID of the currently active saved conversation
+	AutoApproveEdit     bool            // Auto-approve edit_file/write_file for current session
+	AutoApproveEditRoot string          // Limit auto-approved edits to the current folder subtree
 }
 
 // ANSI color codes for console output

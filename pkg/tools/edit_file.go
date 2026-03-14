@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -48,7 +49,7 @@ func (t *EditFileTool) Definition() openai.Tool {
 	}
 }
 
-func (t *EditFileTool) Execute(params map[string]interface{}) (string, error) {
+func (t *EditFileTool) Execute(ctx context.Context, params map[string]interface{}) (string, error) {
 	var args EditFileArgs
 	if err := t.Unmarshal(params, &args); err != nil {
 		return "", err
@@ -59,11 +60,18 @@ func (t *EditFileTool) Execute(params map[string]interface{}) (string, error) {
 		return "", fmt.Errorf("filePath parameter is required")
 	}
 
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+
 	// Check for incremental edit (oldString + newString)
 	if args.OldString != "" {
 		result, err := t.manager.performIncrementalEdit(path, args.OldString, args.NewString, args.ReplaceAll)
 		if err != nil {
 			return "", err
+		}
+		if ctx.Err() != nil {
+			return "", ctx.Err()
 		}
 		return fmt.Sprintf("🚀🚀🚀 INCREMENTAL EDIT MODE (FAST!) 🚀🚀🚀\n%s", result), nil
 	}
@@ -73,6 +81,9 @@ func (t *EditFileTool) Execute(params map[string]interface{}) (string, error) {
 		result, err := t.manager.performIncrementalEdit(path, "", args.NewString, false)
 		if err != nil {
 			return "", err
+		}
+		if ctx.Err() != nil {
+			return "", ctx.Err()
 		}
 		return fmt.Sprintf("🚀🚀🚀 NEW FILE CREATION (FAST!) 🚀🚀🚀\n%s", result), nil
 	}

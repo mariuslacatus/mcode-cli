@@ -2,6 +2,7 @@ package tools
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -48,7 +49,7 @@ func (t *ReadFileTool) Definition() openai.Tool {
 	}
 }
 
-func (t *ReadFileTool) Execute(params map[string]interface{}) (string, error) {
+func (t *ReadFileTool) Execute(ctx context.Context, params map[string]interface{}) (string, error) {
 	var args ReadFileArgs
 	if err := t.Unmarshal(params, &args); err != nil {
 		return "", err
@@ -68,8 +69,11 @@ func (t *ReadFileTool) Execute(params map[string]interface{}) (string, error) {
 	filePath := args.Path
 	if _, err := os.Stat(filePath); os.IsNotExist(err) && !filepath.IsAbs(filePath) {
 		// Try to find the file recursively
-		cmd := exec.Command("find", ".", "-name", filepath.Base(filePath), "-not", "-path", "*/.*")
+		cmd := exec.CommandContext(ctx, "find", ".", "-name", filepath.Base(filePath), "-not", "-path", "*/.*")
 		output, _ := cmd.Output()
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		foundPaths := strings.Split(strings.TrimSpace(string(output)), "\n")
 		if len(foundPaths) > 0 && foundPaths[0] != "" {
 			filePath = foundPaths[0]
@@ -86,6 +90,10 @@ func (t *ReadFileTool) Execute(params map[string]interface{}) (string, error) {
 	totalLines := 0
 	for lineScanner.Scan() {
 		totalLines++
+		if ctx.Err() != nil {
+			f.Close()
+			return "", ctx.Err()
+		}
 	}
 	f.Close()
 
@@ -101,6 +109,9 @@ func (t *ReadFileTool) Execute(params map[string]interface{}) (string, error) {
 	currentLine := 0
 
 	for scanner.Scan() {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		if currentLine >= offset {
 			lines = append(lines, scanner.Text())
 			if limit > 0 && len(lines) >= limit {

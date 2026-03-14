@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -27,7 +28,7 @@ func TestTrimContext(t *testing.T) {
 	// 1000 'hello ' strings will be ~1000-2000 tokens depending on tokenizer
 	longText := strings.Repeat("hello world ", 500)
 
-	messages := []openai.ChatCompletionMessage{
+	messages := []types.Message{
 		{Role: openai.ChatMessageRoleSystem, Content: "System prompt"},
 		{Role: openai.ChatMessageRoleUser, Content: "Message 1 " + longText},
 		{Role: openai.ChatMessageRoleAssistant, Content: "Reply 1"},
@@ -81,5 +82,25 @@ func TestTruncateForLLM(t *testing.T) {
 
 	if !strings.Contains(truncated, "Output truncated") {
 		t.Error("Truncation message missing")
+	}
+}
+
+func TestCanAutoApproveEditForFolder(t *testing.T) {
+	root := filepath.Join(string(filepath.Separator), "tmp", "project")
+	ag := &types.Agent{
+		AutoApproveEdit:     true,
+		AutoApproveEditRoot: root,
+	}
+
+	if !canAutoApproveEditForFolder(ag, root) {
+		t.Fatal("expected exact auto-approve root to be allowed")
+	}
+
+	if !canAutoApproveEditForFolder(ag, filepath.Join(root, "pkg")) {
+		t.Fatal("expected child folder to be allowed")
+	}
+
+	if canAutoApproveEditForFolder(ag, filepath.Join(string(filepath.Separator), "tmp", "other")) {
+		t.Fatal("expected sibling folder to be rejected")
 	}
 }

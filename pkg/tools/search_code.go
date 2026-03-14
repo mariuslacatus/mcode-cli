@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -40,7 +41,7 @@ func (t *SearchCodeTool) Definition() openai.Tool {
 	}
 }
 
-func (t *SearchCodeTool) Execute(params map[string]interface{}) (string, error) {
+func (t *SearchCodeTool) Execute(ctx context.Context, params map[string]interface{}) (string, error) {
 	var args SearchCodeArgs
 	if err := t.Unmarshal(params, &args); err != nil {
 		return "", err
@@ -56,8 +57,12 @@ func (t *SearchCodeTool) Execute(params map[string]interface{}) (string, error) 
 	}
 
 	// Use -E for extended regex support (e.g. | operator)
-	cmd := exec.Command("bash", "-c", fmt.Sprintf("grep -rEnI %q %s | head -n 100", args.Pattern, directory))
+	cmd := exec.CommandContext(ctx, "bash", "-c", fmt.Sprintf("grep -rEnI %q %s | head -n 100", args.Pattern, directory))
 	output, _ := cmd.CombinedOutput()
+
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
 
 	result := string(output)
 	if result == "" {

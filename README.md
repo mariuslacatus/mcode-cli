@@ -32,9 +32,15 @@ Based on minimalist principles, this agent is optimized for **local LLM performa
 go mod tidy
 ```
 
-2. Build the agent:
+2. Build the agent (this will auto-increment the build version):
 ```bash
-go build -o mcode
+make build
+```
+
+3. (Optional) Make it globally available by symlinking it into your local bin directory:
+```bash
+# Assuming ~/.local/bin is in your PATH
+ln -sf $(pwd)/mcode ~/.local/bin/mcode
 ```
 
 ## Usage

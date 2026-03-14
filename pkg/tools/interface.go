@@ -1,6 +1,10 @@
 package tools
 
-import "github.com/sashabaranov/go-openai"
+import (
+	"context"
+
+	"github.com/sashabaranov/go-openai"
+)
 
 // Tool defines the interface that all agent tools must implement
 type Tool interface {
@@ -11,7 +15,7 @@ type Tool interface {
 	Definition() openai.Tool
 
 	// Execute performs the tool's action
-	Execute(params map[string]interface{}) (string, error)
+	Execute(ctx context.Context, params map[string]interface{}) (string, error)
 
 	// Preview returns a string representation of the changes this tool would make
 	Preview(params map[string]interface{}) (string, error)
